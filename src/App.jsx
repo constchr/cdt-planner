@@ -2122,14 +2122,18 @@ export default function Root() {
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, sess) => {
       setSession(sess);
       if (sess?.user) {
-        // Upsert profile on every sign-in so name/email stay fresh
-        await db.upsertProfile({
-          id: sess.user.id,
-          email: sess.user.email,
-          full_name: sess.user.user_metadata?.full_name || sess.user.email,
-        });
-        const prof = await db.getProfile(sess.user.id);
-        setProfile(prof);
+        try {
+          // Upsert profile on every sign-in so name/email stay fresh
+          await db.upsertProfile({
+            id: sess.user.id,
+            email: sess.user.email,
+            full_name: sess.user.user_metadata?.full_name || sess.user.email,
+          });
+          const prof = await db.getProfile(sess.user.id);
+          setProfile(prof);
+        } catch (err) {
+          console.error("Profile load error:", err);
+        }
       } else {
         setProfile(null);
         setAppData(null);
