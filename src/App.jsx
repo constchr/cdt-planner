@@ -127,7 +127,58 @@ const db = {
     if (error) { toast.error("Couldn't load accounts: " + error.message); return []; }
     return data || [];
   },
+  // Audit trail — best-effort: a logging failure must never block the user action.
+  async logHistory(entry) {
+    const { error } = await supabase.from("task_history").insert(entry);
+    if (error) console.error("logHistory:", error.message);
+  },
+  async getHistory(taskId) {
+    const { data, error } = await supabase.from("task_history")
+      .select("*").eq("task_id", taskId).order("created_at", { ascending: false }).limit(50);
+    if (error) { console.error("getHistory:", error.message); return []; }
+    return data || [];
+  },
 };
+
+// Render a saved (or live) status-call report as Markdown for copy/export.
+function reportToMarkdown(report) {
+  const lines = [`# Status Call — ${report.date}`, ""];
+  const members = Object.entries(report.notes || {});
+  const withNotes = members.filter(([, n]) =>
+    Object.values(n.taskNotes || {}).some(v => v && v.trim()) ||
+    (n.extraItems || []).some(x => x.text && x.text.trim()));
+  if (withNotes.length === 0) lines.push("_No comments recorded._", "");
+  withNotes.forEach(([member, n]) => {
+    lines.push(`## ${member}`);
+    Object.entries(n.taskNotes || {}).filter(([, v]) => v && v.trim()).forEach(([taskId, note]) => {
+      const snap = (report.snapshot || []).find(t => t.id === taskId);
+      const meta = snap ? ` — ${snap.summary} _(${snap.status}${snap.dueDate ? `, due ${snap.dueDate}` : ""})_` : "";
+      lines.push(`- **${taskId}**${meta}: ${note.trim()}`);
+    });
+    (n.extraItems || []).filter(x => x.text && x.text.trim()).forEach(x => {
+      lines.push(`- ${x.text.trim()}`);
+    });
+    lines.push("");
+  });
+  return lines.join("\n").trim() + "\n";
+}
+
+// Copy text to the clipboard with a toast confirmation.
+function copyToClipboard(text, label = "Copied to clipboard") {
+  navigator.clipboard.writeText(text)
+    .then(() => toast.success(label))
+    .catch(() => toast.error("Couldn't copy — your browser blocked clipboard access"));
+}
+
+// Trigger a browser download of a text file.
+function downloadText(filename, text, mime = "text/markdown") {
+  const blob = new Blob([text], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 // ─── Small shared hooks/components ─────────────────────────────────────────────
 
@@ -621,6 +672,46 @@ function GanttChart({ enriched, members, memberColors, memberNames, onMoveTask, 
   const todayISO = toISO(new Date());
   const todayOffset = calDaysBetween(minDate, todayISO);
 
+  const LABEL_W = typeof window !== "undefined" && window.innerWidth < 480 ? 88 : 130;
+  const chartW = totalDays * DAY_PX;
+
+  // ── Dependencies ─────────────────────────────────────────────────────────────
+  const [showDeps, setShowDeps] = useState(true);
+
+  // Compute absolute coordinates (within the rows overlay) for every task bar,
+  // then build a line for each declared dependency. A line is "violated" when
+  // the dependent task starts before its blocker finishes.
+  const { depLines, rowsHeight } = useMemo(() => {
+    const coord = {};
+    let y = 0;
+    memberNames.forEach(member => {
+      const mTasks = enriched.filter(t => t.assignee === member);
+      mTasks.forEach((t, ti) => {
+        const startOff = calDaysBetween(minDate, t.startDate);
+        const endOff   = t.endDate ? calDaysBetween(minDate, toISO(t.endDate)) : startOff + t.totalDays;
+        const barTop   = ROW_PAD / 2 + ti * (BAR_H + BAR_GAP);
+        coord[t.id] = {
+          xStart: LABEL_W + startOff * DAY_PX + 2,
+          xEnd:   LABEL_W + Math.max(endOff * DAY_PX - 2, startOff * DAY_PX + 22),
+          y:      y + barTop + BAR_H / 2,
+          startDate: t.startDate,
+          endDate: t.endDate,
+        };
+      });
+      y += rowHeight(mTasks.length);
+    });
+    const lines = [];
+    enriched.forEach(t => {
+      (t.deps || []).forEach(depId => {
+        const from = coord[depId], to = coord[t.id];
+        if (!from || !to) return;
+        const violated = !!(to.startDate && from.endDate && toDate(to.startDate) < from.endDate);
+        lines.push({ key: `${depId}->${t.id}`, x1: from.xEnd, y1: from.y, x2: to.xStart, y2: to.y, violated });
+      });
+    });
+    return { depLines: lines, rowsHeight: y };
+  }, [enriched, memberNames, minDate, LABEL_W]);
+
   // ── Drag state ──────────────────────────────────────────────────────────────
   const dragRef = useRef(null); // { taskId, origStartDate, startClientX }
   const [dropTarget, setDropTarget]     = useState(null);
@@ -711,9 +802,6 @@ function GanttChart({ enriched, members, memberColors, memberNames, onMoveTask, 
   }
 
 
-  const LABEL_W = typeof window !== "undefined" && window.innerWidth < 480 ? 88 : 130;
-  const chartW = totalDays * DAY_PX;
-
   return (
     <div style={{ overflowX: "auto", overflowY: "visible", borderRadius: 10, border: "1px solid #2d3f55", background: "#0b0f1c" }}>
       <div style={{ minWidth: LABEL_W + chartW, position: "relative" }}>
@@ -763,7 +851,8 @@ function GanttChart({ enriched, members, memberColors, memberNames, onMoveTask, 
           </div>
         </div>
 
-        {/* ── Per-member rows ── */}
+        {/* ── Per-member rows (wrapped so the dependency overlay shares coords) ── */}
+        <div style={{ position: "relative" }}>
         {memberNames.map((member, mi) => {
           const color = memberColors[member];
           const mTasks = enriched.filter(t => t.assignee === member);
@@ -948,6 +1037,33 @@ function GanttChart({ enriched, members, memberColors, memberNames, onMoveTask, 
           );
         })}
 
+        {/* Dependency arrows overlay — shares the rows' coordinate origin */}
+        {showDeps && depLines.length > 0 && (
+          <svg width={LABEL_W + chartW} height={rowsHeight} style={{ position: "absolute", top: 0, left: 0, pointerEvents: "none", zIndex: 6, overflow: "visible" }}>
+            <defs>
+              <marker id="dep-arrow" markerWidth="7" markerHeight="7" refX="5.5" refY="3" orient="auto">
+                <path d="M0,0 L6,3 L0,6 Z" fill="#6b84a0" />
+              </marker>
+              <marker id="dep-arrow-bad" markerWidth="7" markerHeight="7" refX="5.5" refY="3" orient="auto">
+                <path d="M0,0 L6,3 L0,6 Z" fill="#ef4444" />
+              </marker>
+            </defs>
+            {depLines.map(l => {
+              const midX = (l.x1 + l.x2) / 2;
+              const path = `M ${l.x1} ${l.y1} C ${midX} ${l.y1}, ${midX} ${l.y2}, ${l.x2} ${l.y2}`;
+              return (
+                <path key={l.key} d={path} fill="none"
+                  stroke={l.violated ? "#ef4444" : "#6b84a0"}
+                  strokeWidth={l.violated ? 2 : 1.5}
+                  strokeDasharray={l.violated ? "5 3" : "none"}
+                  opacity={l.violated ? 0.95 : 0.6}
+                  markerEnd={`url(#${l.violated ? "dep-arrow-bad" : "dep-arrow"})`} />
+              );
+            })}
+          </svg>
+        )}
+        </div>
+
         {/* Today line overlay label */}
         <div style={{
           position: "absolute",
@@ -967,14 +1083,25 @@ function GanttChart({ enriched, members, memberColors, memberNames, onMoveTask, 
       </div>
 
       {/* Legend */}
-      <div style={{ display: "flex", gap: 18, padding: "10px 16px", borderTop: "1px solid #2d3f55", flexWrap: "wrap" }}>
+      <div style={{ display: "flex", gap: 18, padding: "10px 16px", borderTop: "1px solid #2d3f55", flexWrap: "wrap", alignItems: "center" }}>
         <div style={{ fontSize: 13, color: "#b8cfe0", display: "flex", alignItems: "center", gap: 5 }}>
           <div style={{ width: 16, height: 8, borderRadius: 2, background: "rgba(0,0,0,0.25)" }} /> Weekends
         </div>
         <div style={{ fontSize: 13, color: "#b8cfe0", display: "flex", alignItems: "center", gap: 5 }}>
           <div style={{ width: 16, height: 8, borderRadius: 2, background: "repeating-linear-gradient(45deg,transparent,transparent 3px,rgba(0,0,0,0.5) 3px,rgba(0,0,0,0.5) 4px)", border: "1px solid #8ba0b8" }} /> Buffer days
         </div>
-        <div style={{ fontSize: 13, color: "#b8cfe0" }}>Drag bars to reschedule · drop onto a member row to reassign · click to edit · ← → keys nudge a focused bar</div>
+        <label style={{ fontSize: 13, color: "#b8cfe0", display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+          <input type="checkbox" checked={showDeps} onChange={e => setShowDeps(e.target.checked)} style={{ accentColor: "#6b84a0", cursor: "pointer" }} />
+          <svg width="22" height="8"><line x1="0" y1="4" x2="16" y2="4" stroke="#6b84a0" strokeWidth="1.5" /><path d="M16,1 L21,4 L16,7 Z" fill="#6b84a0" /></svg>
+          Dependencies
+        </label>
+        {depLines.some(l => l.violated) && (
+          <div style={{ fontSize: 13, color: "#fca5a5", display: "flex", alignItems: "center", gap: 5 }}>
+            <svg width="22" height="8"><line x1="0" y1="4" x2="16" y2="4" stroke="#ef4444" strokeWidth="2" strokeDasharray="4 2" /><path d="M16,1 L21,4 L16,7 Z" fill="#ef4444" /></svg>
+            starts before blocker ends
+          </div>
+        )}
+        <div style={{ fontSize: 13, color: "#b8cfe0" }}>Drag to reschedule · drop on a member to reassign · click to edit · ← → nudge</div>
       </div>
     </div>
   );
@@ -1045,7 +1172,12 @@ function PlannerApp({ initData, onLogout }) {
   const [selectedMember, setSelectedMember] = useState(null);
   const [taskSearch, setTaskSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("All");
+  const [overdueOnly, setOverdueOnly] = useState(false);
+  const [ganttStatusFilter, setGanttStatusFilter] = useState("All");
+  const [ganttCustomerFilter, setGanttCustomerFilter] = useState("All");
   const isMobile = useMediaQuery("(max-width: 480px)");
+  const actor = auth?.memberName || auth?.email || "someone";
+  function logHistory(taskId, action, detail) { db.logHistory({ task_id: taskId, actor, action, detail }); }
 
   // statusNotes: { [memberName]: { taskNotes: { [taskId]: string }, extraItems: [{id, text}] } }
   const [statusNotes, setStatusNotes] = useState({});
@@ -1172,6 +1304,22 @@ function PlannerApp({ initData, onLogout }) {
     return { members: memberStats, teamUtilization, totalPlanned, totalAvailable };
   }, [enriched, memberNames, members, memberColors]);
 
+  const overdueCount = useMemo(
+    () => enriched.filter(t => isOverdue(t.dueDate) && t.status !== "Done").length,
+    [enriched]);
+
+  // Tasks shown on the Schedule (Gantt/list), after the customer/status filters.
+  const scheduleEnriched = useMemo(() => enriched.filter(t => {
+    if (ganttStatusFilter !== "All" && t.status !== ganttStatusFilter) return false;
+    if (ganttCustomerFilter !== "All" && (t.customer || "") !== ganttCustomerFilter) return false;
+    return true;
+  }), [enriched, ganttStatusFilter, ganttCustomerFilter]);
+
+  function showOverdue() {
+    setSelectedMember(null); setStatusFilter("All"); setTaskSearch(""); setOverdueOnly(true);
+    setView("workload");
+  }
+
   function addMemberIfNew(name) {
     if (name && !members[name]) setMembers(p => ({ ...p, [name]: { fte: 1.0, sort_order: Object.keys(p).length } }));
   }
@@ -1207,7 +1355,12 @@ function PlannerApp({ initData, onLogout }) {
     if (!ok) setTasks(p => p.map(t => t.id === id ? task : t)); // revert just this task
     return ok;
   }
-  function updateStatus(id, status) { persistTaskUpdate(id, { status }); }
+  function updateStatus(id, status) {
+    const prev = tasks.find(t => t.id === id);
+    persistTaskUpdate(id, { status }).then(ok => {
+      if (ok && prev && prev.status !== status) logHistory(id, "status", `${prev.status} → ${status}`);
+    });
+  }
   function updateField(id, field, val) { persistTaskUpdate(id, { [field]: val }); }
 
   async function deleteTask(id) {
@@ -1216,9 +1369,10 @@ function PlannerApp({ initData, onLogout }) {
     setTasks(p => p.filter(t => t.id !== id));            // optimistic remove
     const ok = await db.deleteTask(id);
     if (!ok) { setTasks(p => p.some(t => t.id === id) ? p : [...p, task]); return; } // rollback
+    logHistory(id, "delete", task.summary);
     toast.emit({
       type: "success", message: `Deleted ${task.id}`, duration: 6000, actionLabel: "Undo",
-      action: () => { db.upsertTask(task); setTasks(p => p.some(t => t.id === task.id) ? p : [...p, task]); },
+      action: () => { db.upsertTask(task); logHistory(id, "restore", task.summary); setTasks(p => p.some(t => t.id === task.id) ? p : [...p, task]); },
     });
   }
 
@@ -1227,7 +1381,9 @@ function PlannerApp({ initData, onLogout }) {
     const patch = {};
     if (newStartDate) patch.startDate = newStartDate;
     if (newAssignee)  patch.assignee = newAssignee;
-    persistTaskUpdate(taskId, patch);
+    persistTaskUpdate(taskId, patch).then(ok => {
+      if (ok && newStartDate) logHistory(taskId, "reschedule", `start → ${newStartDate}`);
+    });
   }
 
   // Gantt: drop onto member row → reassign (and optionally shift start date)
@@ -1240,6 +1396,7 @@ function PlannerApp({ initData, onLogout }) {
       ...(newStartDate ? { startDate: newStartDate } : {}),
     });
     if (ok && prevAssignee !== memberName) {
+      logHistory(taskId, "reassign", `${prevAssignee} → ${memberName}`);
       toast.emit({
         type: "info", message: `Moved ${task.id} → ${memberName}`, duration: 6000, actionLabel: "Undo",
         action: () => persistTaskUpdate(taskId, { assignee: prevAssignee, startDate: prevStart }),
@@ -1376,6 +1533,13 @@ function PlannerApp({ initData, onLogout }) {
             <div style={{ display: "flex", gap: 5, marginTop: 2, flexWrap: "wrap" }}>
               <StatChip label="tasks" value={tasks.length} />
               <StatChip label={auth?.role} value={auth?.memberName} color={auth?.role === "admin" ? "#a16ef5" : "#5b9cf6"} accent={auth?.role === "admin" ? "#a16ef5" : "#5b9cf6"} />
+              {overdueCount > 0 && (
+                <button onClick={showOverdue} title="Show overdue tasks" style={{
+                  display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer",
+                  background: "#ef444422", border: "1px solid #ef4444", borderRadius: 5, padding: "1px 8px",
+                  color: "#fca5a5", fontFamily: "inherit", fontSize: 12, fontWeight: 700, letterSpacing: "0.04em",
+                }}>⚠ {overdueCount} overdue</button>
+              )}
             </div>
           </div>
         </div>
@@ -1479,6 +1643,7 @@ function PlannerApp({ initData, onLogout }) {
                 : isAdmin ? enriched : enriched.filter(t => t.assignee === myName);
               const q = taskSearch.trim().toLowerCase();
               const visibleTasks = baseTasks.filter(t => {
+                if (overdueOnly && !(isOverdue(t.dueDate) && t.status !== "Done")) return false;
                 if (statusFilter !== "All" && t.status !== statusFilter) return false;
                 if (!q) return true;
                 return [t.summary, t.id, t.assignee, t.customer].some(v => (v || "").toLowerCase().includes(q));
@@ -1489,6 +1654,13 @@ function PlannerApp({ initData, onLogout }) {
                     <div style={{ fontSize: 13, color: "#b8cfe0", letterSpacing: "0.1em" }}>
                       {selectedMember ? `${selectedMember.toUpperCase()}'S TASKS` : "ALL TASKS"}
                     </div>
+                    {overdueOnly && (
+                      <button onClick={() => setOverdueOnly(false)} title="Clear overdue filter" style={{
+                        display: "inline-flex", alignItems: "center", gap: 5, cursor: "pointer",
+                        background: "#ef444422", border: "1px solid #ef4444", borderRadius: 5, padding: "2px 9px",
+                        color: "#fca5a5", fontFamily: "inherit", fontSize: 12, fontWeight: 700,
+                      }}>⚠ Overdue only ×</button>
+                    )}
                     <div style={{ flex: 1 }} />
                     <input
                       value={taskSearch}
@@ -1540,20 +1712,34 @@ function PlannerApp({ initData, onLogout }) {
               />
             ) : (
               <>
-                <div style={{ marginBottom: 14, fontSize: 14, color: "#b8cfe0", lineHeight: 1.7 }}>
-                  <span style={{ color: "#F7D44F" }}>Formula: </span>
-                  working days = ⌈MD × (1/FTE) × (100/Eff%)⌉ + buffer (skipping weekends) · due = next Friday after last day
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
+                  <div style={{ flex: 1, minWidth: 180, fontSize: 14, color: "#b8cfe0", lineHeight: 1.7 }}>
+                    <span style={{ color: "#F7D44F" }}>Formula: </span>
+                    working days = ⌈MD × (1/FTE) × (100/Eff%)⌉ + buffer · due = next Friday
+                  </div>
+                  <select value={ganttCustomerFilter} onChange={e => setGanttCustomerFilter(e.target.value)}
+                    title="Filter by customer"
+                    style={{ ...inputStyle, width: 150, padding: "7px 10px", fontSize: 13, cursor: "pointer" }}>
+                    <option value="All">All customers</option>
+                    {customers.map(c => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                  <select value={ganttStatusFilter} onChange={e => setGanttStatusFilter(e.target.value)}
+                    title="Filter by status"
+                    style={{ ...inputStyle, width: 130, padding: "7px 10px", fontSize: 13, cursor: "pointer" }}>
+                    <option value="All">All statuses</option>
+                    {Object.keys(STATUS_CONFIG).map(s => <option key={s} value={s}>{s}</option>)}
+                  </select>
                 </div>
                 {isMobile ? (
                   <ScheduleListView
-                    enriched={enriched}
+                    enriched={scheduleEnriched}
                     memberNames={memberNames}
                     memberColors={memberColors}
                     onEditTask={isAdmin ? (task => setEditTaskModal({ open: true, task })) : null}
                   />
                 ) : (
                   <GanttChart
-                    enriched={enriched}
+                    enriched={scheduleEnriched}
                     members={members}
                     memberColors={memberColors}
                     memberNames={memberNames}
@@ -1653,7 +1839,8 @@ function PlannerApp({ initData, onLogout }) {
             setTasks(p => [...p, newTask]);                       // optimistic
             setAddTaskModal({ open: false, assignee: "", startDate: toISO(new Date()) });
             const ok = await db.upsertTask(newTask);
-            if (!ok) setTasks(p => p.filter(t => t.id !== id));   // rollback
+            if (!ok) { setTasks(p => p.filter(t => t.id !== id)); return; } // rollback
+            logHistory(id, "create", newTask.summary);
           }}
           onClose={() => setAddTaskModal({ open: false, assignee: "", startDate: toISO(new Date()) })}
         />
@@ -1675,7 +1862,8 @@ function PlannerApp({ initData, onLogout }) {
             setTasks(p => p.map(t => t.id === saved.id ? { ...t, ...saved } : t)); // optimistic
             setEditTaskModal({ open: false, task: null });
             const ok = await db.upsertTask(saved);
-            if (!ok && prev) setTasks(p => p.map(t => t.id === saved.id ? prev : t)); // rollback
+            if (!ok && prev) { setTasks(p => p.map(t => t.id === saved.id ? prev : t)); return; } // rollback
+            logHistory(saved.id, "edit", "updated task details");
           }}
           onDelete={(id) => { deleteTask(id); setEditTaskModal({ open: false, task: null }); }}
           onClose={() => setEditTaskModal({ open: false, task: null })}
@@ -2097,6 +2285,15 @@ function StatusCallView({ memberNames, memberColors, members, enriched, statusNo
             background: "transparent", color: "#b8cfe0", fontFamily: "inherit",
             fontSize: 13, fontWeight: 700, cursor: "pointer", letterSpacing: "0.08em",
           }}>CLEAR NOTES</button>
+          <button onClick={() => copyToClipboard(reportToMarkdown({
+            date: today,
+            notes: statusNotes,
+            snapshot: enriched.map(t => ({ id: t.id, summary: t.summary, assignee: t.assignee, status: t.status, dueDate: t.dueDate ? toISO(t.dueDate) : null, jiraUrl: t.jiraUrl || "" })),
+          }), "Status call copied as Markdown")} style={{
+            padding: "6px 12px", borderRadius: 6, border: "1px solid #3dd68c",
+            background: "transparent", color: "#3dd68c", fontFamily: "inherit",
+            fontSize: 13, fontWeight: 700, cursor: "pointer", letterSpacing: "0.08em",
+          }}>COPY MD ⧉</button>
           <button onClick={onSaveReport} style={{
             padding: "6px 14px", borderRadius: 6, border: "none",
             background: "linear-gradient(135deg,#4FD4A0,#4F8EF7)", color: "#0b0f1c",
@@ -2376,7 +2573,11 @@ function ReportsView({ reports, onDeleteReport }) {
                       <button onClick={() => setConfirmDelete(null)} style={smBtn("#b8cfe0")}>No</button>
                     </>
                   ) : (
-                    <button onClick={() => setConfirmDelete(report.id)} style={smBtn("#3d5068")} title="Delete report">🗑</button>
+                    <>
+                      <button onClick={() => copyToClipboard(reportToMarkdown(report), "Report copied as Markdown")} style={smBtn("#3dd68c")} title="Copy as Markdown">⧉ MD</button>
+                      <button onClick={() => downloadText(`status-call-${report.isoDate}.md`, reportToMarkdown(report))} style={smBtn("#5b9cf6")} title="Download Markdown">↓</button>
+                      <button onClick={() => setConfirmDelete(report.id)} style={smBtn("#3d5068")} title="Delete report">🗑</button>
+                    </>
                   )}
                   <span style={{ fontSize: 19, color: isExpanded ? "#D44FB8" : "#b8cfe0" }}>{isExpanded ? "▲" : "▼"}</span>
                 </div>
@@ -2777,6 +2978,9 @@ function AddTaskModal({ initialAssignee, initialStartDate, memberNames, members,
 function EditTaskModal({ task: initialTask, memberNames, members, customers, onAddCustomer, onSave, onDelete, onClose }) {
   const [task, setTask] = useState({ ...initialTask });
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [depInput, setDepInput] = useState((initialTask.deps || []).join("; "));
+  const [history, setHistory] = useState(null);
+  useEffect(() => { db.getHistory(initialTask.id).then(setHistory); }, [initialTask.id]);
   const f = (k, v) => setTask(p => ({ ...p, [k]: v }));
 
   const m      = members[task.assignee] || { fte: 1 };
@@ -2845,12 +3049,36 @@ function EditTaskModal({ task: initialTask, memberNames, members, customers, onA
                 <div><label style={lStyle}>BUFFER DAYS</label><input type="number" min="0" step="1" value={task.bufferDays} onChange={e => f("bufferDays",e.target.value)} style={iStyle} /></div>
               </div>
             </div>
+            <div style={{ gridColumn:"1/-1" }}>
+              <label style={lStyle}>DEPENDENCIES (blocking task IDs, semicolon-separated)</label>
+              <input value={depInput} onChange={e => { setDepInput(e.target.value); f("deps", e.target.value.split(";").map(d=>d.trim()).filter(Boolean)); }} placeholder="e.g. T-101; T-102" style={iStyle} />
+            </div>
 
             {/* Preview */}
             <div style={{ gridColumn:"1/-1", padding:"13px 15px", background: overdue ? "color-mix(in srgb,#f87171 8%,var(--bg-card,#111827))" : "color-mix(in srgb, var(--status-done-bg,#0d3328) 60%, transparent)", border:`1px solid ${overdue?"#f8717144":"#3dd68c44"}`, borderRadius:8 }}>
               <div style={{ fontSize:11, color: overdue?"#f87171":"#3dd68c", letterSpacing:"0.1em", marginBottom:8 }}>{overdue ? "⚠ OVERDUE" : "SCHEDULE"}</div>
               <StatRow gap={6}><StatChip label="man-days" value={`${md} md`} /><StatChip label="FTE" value={m.fte} /><StatChip label="efficiency" value={`${eff}%`} color={eff>100?"#3dd68c":eff<100?"#f5854a":"var(--fg-muted)"} /><StatChip label="buffer" value={`${buf}d`} color={buf>0?"#fbbf24":"var(--fg-muted)"} /></StatRow>
               <StatRow gap={6} mt={8}><StatChip label="working days" value={`${wdays}d`} color="var(--p1,#5b9cf6)" accent="var(--p1,#5b9cf6)" /><StatChip label="total" value={`${total}d`} color="var(--p4,#e879f9)" accent="var(--p4,#e879f9)" />{due && <StatChip label="due" value={fmtDate(due)} color={overdue?"#f87171":"#fbbf24"} accent={overdue?"#f87171":"#fbbf24"} />}</StatRow>
+            </div>
+
+            {/* Activity history (#7) */}
+            <div style={{ gridColumn:"1/-1" }}>
+              <label style={lStyle}>ACTIVITY</label>
+              {history === null ? (
+                <div style={{ fontSize:13, color:"var(--fg-faint,#94b4cc)" }}>Loading history…</div>
+              ) : history.length === 0 ? (
+                <div style={{ fontSize:13, color:"var(--fg-faint,#94b4cc)" }}>No recorded activity yet.</div>
+              ) : (
+                <div style={{ display:"flex", flexDirection:"column", gap:7, maxHeight:160, overflowY:"auto", paddingRight:4 }}>
+                  {history.map(h => (
+                    <div key={h.id} style={{ display:"flex", gap:8, alignItems:"baseline", fontSize:13 }}>
+                      <span style={{ fontSize:11, fontWeight:700, padding:"1px 6px", borderRadius:3, background:"#1e2d42", color:"#9eb5cc", flexShrink:0, textTransform:"uppercase", letterSpacing:"0.05em" }}>{h.action}</span>
+                      <span style={{ color:"#d4e1ed", flex:1, minWidth:0 }}>{h.detail || ""}</span>
+                      <span style={{ color:"#6b84a0", whiteSpace:"nowrap" }}>{h.actor} · {new Date(h.created_at).toLocaleDateString("en-GB", { day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit" })}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         </div>
