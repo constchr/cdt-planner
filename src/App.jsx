@@ -842,6 +842,26 @@ function PlannerApp({ initData, onLogout }) {
     setCustomers(prev => prev.includes(name) ? prev : [...prev, name].sort());
   }
 
+  // Real-time: reflect task changes from other users into the live task state.
+  // Own writes echo back here too and simply reconcile to the server value.
+  // (Subscription lives here — not in Root — because Root passes tasks to this
+  // component only once at mount, so updates must land on this component's state.)
+  useEffect(() => {
+    const ch = supabase.channel("tasks-rt")
+      .on("postgres_changes", { event: "*", schema: "public", table: "tasks" }, payload => {
+        setTasksRaw(prev => {
+          if (payload.eventType === "DELETE")
+            return prev.filter(t => t.id !== payload.old.id);
+          const incoming = appTask(payload.new);
+          return prev.some(t => t.id === incoming.id)
+            ? prev.map(t => t.id === incoming.id ? incoming : t)
+            : [...prev, incoming];
+        });
+      })
+      .subscribe();
+    return () => supabase.removeChannel(ch);
+  }, []);
+
   const memberNames = useMemo(() => Object.keys(members), [members]);
   const memberColors = useMemo(() => {
     const map = {};
@@ -899,38 +919,40 @@ function PlannerApp({ initData, onLogout }) {
   }
   function updateMember(name, field, val) { setMembers(p => ({ ...p, [name]: { ...p[name], [field]: val } })); }
   function updateStatus(id, status) {
-    setTasks(p => p.map(t => t.id === id ? { ...t, status } : t));
-
+    const task = tasks.find(t => t.id === id);
+    if (!task) return;
+    const updated = { ...task, status };
+    db.upsertTask(updated);
+    setTasks(p => p.map(t => t.id === id ? updated : t));
   }
   function updateField(id, field, val) {
-    setTasks(p => p.map(t => {
-      if (t.id !== id) return t;
-      const updated = { ...t, [field]: val };
-      db.upsertTask(updated);
-      return updated;
-    }));
+    const task = tasks.find(t => t.id === id);
+    if (!task) return;
+    const updated = { ...task, [field]: val };
+    db.upsertTask(updated);
+    setTasks(p => p.map(t => t.id === id ? updated : t));
   }
   function deleteTask(id) {
+    db.deleteTask(id);
     setTasks(p => p.filter(t => t.id !== id));
   }
 
   // Gantt: move task start date
   function handleMoveTask(taskId, newStartDate, newAssignee) {
-    setTasks(p => p.map(t => {
-      if (t.id !== taskId) return t;
-      const updated = { ...t, startDate: newStartDate || t.startDate, assignee: newAssignee || t.assignee };
-      return updated;
-    }));
+    const task = tasks.find(t => t.id === taskId);
+    if (!task) return;
+    const updated = { ...task, startDate: newStartDate || task.startDate, assignee: newAssignee || task.assignee };
+    db.upsertTask(updated);
+    setTasks(p => p.map(t => t.id === taskId ? updated : t));
   }
 
   // Gantt: drop onto member row → reassign (and optionally shift start date)
   function handleDropTask(taskId, memberName, newStartDate) {
-    setTasks(p => {
-      const task = p.find(t => t.id === taskId);
-      if (!task) return p;
-      const updated = { ...task, assignee: memberName, ...(newStartDate ? { startDate: newStartDate } : {}) };
-      db.upsertTask(updated); return [...p.filter(t => t.id !== taskId), updated];
-    });
+    const task = tasks.find(t => t.id === taskId);
+    if (!task) return;
+    const updated = { ...task, assignee: memberName, ...(newStartDate ? { startDate: newStartDate } : {}) };
+    db.upsertTask(updated);
+    setTasks(p => p.map(t => t.id === taskId ? updated : t));
   }
 
   function saveReport() {
@@ -1259,7 +1281,13 @@ function PlannerApp({ initData, onLogout }) {
                 delete next[oldName];
                 return next;
               });
-              setTasks(prev => prev.map(t => t.assignee === oldName ? { ...t, assignee: newName } : t));
+              // Persist the reassignment of every affected task, not just local state
+              setTasks(prev => prev.map(t => {
+                if (t.assignee !== oldName) return t;
+                const updated = { ...t, assignee: newName };
+                db.upsertTask(updated);
+                return updated;
+              }));
             }}
             onRemoveMember={name => {
               setMembers(prev => { const next = { ...prev }; delete next[name]; return next; });
@@ -2226,26 +2254,6 @@ export default function Root() {
     }
     load();
   }, [session, profile]);
-
-  // Real-time: tasks table
-  useEffect(() => {
-    if (!session) return;
-    const ch = supabase.channel("tasks-rt")
-      .on("postgres_changes", { event:"*", schema:"public", table:"tasks" }, payload => {
-        setAppData(prev => {
-          if (!prev) return prev;
-          if (payload.eventType === "DELETE")
-            return { ...prev, tasks: prev.tasks.filter(t => t.id !== payload.old.id) };
-          const incoming = appTask(payload.new);
-          const exists = prev.tasks.some(t => t.id === incoming.id);
-          return { ...prev, tasks: exists
-            ? prev.tasks.map(t => t.id === incoming.id ? incoming : t)
-            : [...prev.tasks, incoming] };
-        });
-      })
-      .subscribe();
-    return () => supabase.removeChannel(ch);
-  }, [session]);
 
   const Loading = ({msg}) => (
     <div style={{ height:"100vh", width:"100vw", background:"#0b0f1c", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:16, fontFamily:"'Inter',sans-serif" }}>
