@@ -163,6 +163,63 @@ function reportToMarkdown(report) {
   return lines.join("\n").trim() + "\n";
 }
 
+// ─── Jira XML import ──────────────────────────────────────────────────────────
+
+function mapJiraStatus(s) {
+  const v = (s || "").toLowerCase();
+  if (/progress|review|testing|uat/.test(v)) return "In Progress";
+  if (/block|imped|hold|waiting/.test(v))    return "Blocked";
+  if (/done|closed|resolved|complete|deploy|live/.test(v)) return "Done";
+  return "To Do";
+}
+function mapJiraPriority(p) {
+  const v = (p || "").toLowerCase();
+  if (/block|critical|highest/.test(v))   return "Critical";
+  if (/high|major|urgent/.test(v))        return "High";
+  if (/low|minor|lowest|trivial/.test(v)) return "Low";
+  return "Medium"; // normal / medium / default
+}
+
+// Parse a Jira "Export → XML" (RSS) document into draft tasks. Tolerant of the
+// leading "This XML file…" text browsers prepend when you copy from the viewer.
+function parseJiraXml(raw, hoursPerDay = 8) {
+  if (!raw || !raw.trim()) return { tasks: [], error: "Paste the Jira XML first." };
+  const cut = raw.indexOf("<");
+  const xml = cut > 0 ? raw.slice(cut) : raw;
+  let doc;
+  try { doc = new DOMParser().parseFromString(xml, "application/xml"); }
+  catch { return { tasks: [], error: "Could not parse the XML." }; }
+  if (doc.querySelector("parsererror")) return { tasks: [], error: "That doesn't look like valid Jira XML." };
+  const items = [...doc.querySelectorAll("item")];
+  if (items.length === 0) return { tasks: [], error: "No <item> tickets found in this XML." };
+
+  const txt = (el, sel) => el.querySelector(sel)?.textContent?.trim() || "";
+  const tasks = items.map(item => {
+    const created = txt(item, "created");
+    const cd = created ? new Date(created) : null;
+    const startDate = cd && !isNaN(cd) ? toISO(cd) : toISO(new Date());
+    const est = item.querySelector("timeoriginalestimate");
+    const seconds = est ? parseInt(est.getAttribute("seconds") || "0", 10) : 0;
+    const manDays = seconds ? Math.max(0.25, Math.round((seconds / 3600 / hoursPerDay) * 100) / 100) : 1;
+    let customer = "";
+    item.querySelectorAll("customfield").forEach(cf => {
+      if (cf.querySelector("customfieldname")?.textContent?.trim() === "Customer")
+        customer = cf.querySelector("customfieldvalue")?.textContent?.trim() || customer;
+    });
+    return {
+      id: txt(item, "key"),
+      summary: txt(item, "summary") || txt(item, "title"),
+      assignee: txt(item, "assignee"),
+      customer,
+      status: mapJiraStatus(txt(item, "status")),
+      priority: mapJiraPriority(txt(item, "priority")),
+      manDays, efficiencyPct: 100, bufferDays: 0,
+      startDate, deps: [], jiraUrl: txt(item, "link"),
+    };
+  }).filter(t => t.id || t.summary);
+  return { tasks, error: null };
+}
+
 // Copy text to the clipboard with a toast confirmation.
 function copyToClipboard(text, label = "Copied to clipboard") {
   navigator.clipboard.writeText(text)
@@ -1183,6 +1240,7 @@ function PlannerApp({ initData, onLogout }) {
   const [statusNotes, setStatusNotes] = useState({});
   const [addTaskModal, setAddTaskModal] = useState({ open: false, assignee: "", startDate: toISO(new Date()) });
   const [editTaskModal, setEditTaskModal] = useState({ open: false, task: null });
+  const [importOpen, setImportOpen] = useState(false);
 
   // Guard against losing unsaved Status Call notes when navigating or closing.
   const hasUnsavedNotes = useMemo(() => notesHaveContent(statusNotes), [statusNotes]);
@@ -1232,6 +1290,28 @@ function PlannerApp({ initData, onLogout }) {
   function addCustomer(name) {
     if (!customers.includes(name)) db.upsertCustomer(name);
     setCustomers(prev => prev.includes(name) ? prev : [...prev, name].sort());
+  }
+
+  // Create (or overwrite) tasks parsed from a Jira XML import.
+  async function importTasks(rows) {
+    let count = 0;
+    for (const r of rows) {
+      const id = r.id || `T-${Date.now()}-${count}`;
+      const task = {
+        id, summary: r.summary, assignee: r.assignee, customer: r.customer || "",
+        status: r.status, priority: r.priority,
+        manDays: parseFloat(r.manDays) || 1, efficiencyPct: parseFloat(r.efficiencyPct) || 100,
+        bufferDays: parseInt(r.bufferDays) || 0, startDate: r.startDate, deps: r.deps || [],
+        jiraUrl: r.jiraUrl || "",
+      };
+      if (task.assignee) addMemberIfNew(task.assignee);
+      if (task.customer) addCustomer(task.customer);
+      setTasks(p => p.some(t => t.id === id) ? p.map(t => t.id === id ? task : t) : [...p, task]);
+      const ok = await db.upsertTask(task);
+      if (ok) { logHistory(id, "import", "imported from Jira"); count++; }
+    }
+    setImportOpen(false);
+    toast.success(`Imported ${count} task${count === 1 ? "" : "s"} from Jira`);
   }
 
   // Real-time: reflect task changes from other users into the live task state.
@@ -1702,7 +1782,16 @@ function PlannerApp({ initData, onLogout }) {
         {/* ══ SCHEDULE (Gantt) ══ */}
         {view === "schedule" && (
           <div>
-            <ViewHeader label="SCHEDULE" accent="#F7D44F" title="Timeline by Person" />
+            <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+              <ViewHeader label="SCHEDULE" accent="#F7D44F" title="Timeline by Person" />
+              {isAdmin && (
+                <button onClick={() => setImportOpen(true)} style={{
+                  padding: "8px 16px", borderRadius: 8, border: "1px solid #5b9cf6",
+                  background: "#5b9cf615", color: "#6baaf8", fontFamily: "inherit",
+                  fontSize: 13, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap",
+                }}>⬇ Import from Jira</button>
+              )}
+            </div>
             {memberNames.length === 0 ? (
               <EmptyState
                 icon="🗓️"
@@ -1867,6 +1956,14 @@ function PlannerApp({ initData, onLogout }) {
           }}
           onDelete={(id) => { deleteTask(id); setEditTaskModal({ open: false, task: null }); }}
           onClose={() => setEditTaskModal({ open: false, task: null })}
+        />
+      )}
+      {importOpen && (
+        <ImportModal
+          memberNames={memberNames}
+          existingIds={new Set(tasks.map(t => t.id))}
+          onImport={importTasks}
+          onClose={() => setImportOpen(false)}
         />
       )}
     </div>
@@ -3100,6 +3197,119 @@ function EditTaskModal({ task: initialTask, memberNames, members, customers, onA
             <button onClick={onClose} style={{ padding:"10px 22px", borderRadius:8, border:"1px solid var(--border,#2d3f55)", background:"transparent", color:"var(--fg-muted,#b8cfe0)", fontFamily:"inherit", fontWeight:700, fontSize:14, cursor:"pointer" }}>CANCEL</button>
             <button onClick={() => onSave(task)} style={{ padding:"10px 26px", borderRadius:8, border:"none", background:"var(--accent,#5b9cf6)", color:"#fff", fontFamily:"inherit", fontWeight:700, fontSize:14, cursor:"pointer" }}>SAVE CHANGES</button>
           </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Jira XML import modal ─────────────────────────────────────────────────────
+
+function ImportModal({ memberNames, existingIds, onImport, onClose }) {
+  const [raw, setRaw]       = useState("");
+  const [error, setError]   = useState("");
+  const [rows, setRows]     = useState(null); // null = not parsed yet
+  const iStyle = { width:"100%", padding:"7px 9px", borderRadius:6, background:"var(--bg-inset,#0f1a2e)", border:"1px solid var(--border,#2d3f55)", color:"var(--fg,#f0f4ff)", fontSize:12, fontFamily:"inherit", outline:"none", boxSizing:"border-box" };
+  const lStyle = { fontSize:10, color:"var(--fg-faint,#94b4cc)", letterSpacing:"0.08em", display:"block", marginBottom:3, fontWeight:600 };
+
+  function parse() {
+    const { tasks, error } = parseJiraXml(raw);
+    if (error) { setError(error); setRows(null); return; }
+    setError("");
+    // Default: include all; map assignee to an existing member if the name matches.
+    setRows(tasks.map(t => {
+      const match = memberNames.find(m => m.toLowerCase() === (t.assignee || "").toLowerCase());
+      return { ...t, include: true, assignee: match || t.assignee || (memberNames[0] || "") };
+    }));
+  }
+
+  const setRow = (i, patch) => setRows(rs => rs.map((r, j) => j === i ? { ...r, ...patch } : r));
+  const selected = (rows || []).filter(r => r.include && r.id && r.summary && r.assignee);
+
+  function onBackdrop(e) { if (e.target === e.currentTarget) onClose(); }
+
+  return (
+    <div onClick={onBackdrop} style={{ position:"fixed", inset:0, zIndex:500, background:"rgba(0,0,0,0.65)", backdropFilter:"blur(4px)", display:"flex", alignItems:"center", justifyContent:"center", padding:"20px" }}>
+      <div style={{ background:"var(--bg-card,#111827)", border:"1px solid var(--border,#2d3f55)", borderRadius:14, width:"min(880px,100%)", maxHeight:"90vh", display:"flex", flexDirection:"column", boxShadow:"0 24px 64px rgba(0,0,0,0.6)" }}>
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"18px 24px", borderBottom:"1px solid var(--border,#2d3f55)", flexShrink:0 }}>
+          <div>
+            <div style={{ fontSize:11, color:"#5b9cf6", letterSpacing:"0.15em", marginBottom:2 }}>IMPORT</div>
+            <div style={{ fontSize:19, fontWeight:700, color:"var(--fg,#f0f4ff)" }}>Import from Jira XML</div>
+          </div>
+          <button onClick={onClose} style={{ background:"none", border:"1px solid var(--border,#2d3f55)", borderRadius:7, color:"var(--fg-muted,#b8cfe0)", fontSize:18, cursor:"pointer", width:34, height:34 }}>×</button>
+        </div>
+
+        <div style={{ overflowY:"auto", padding:"18px 24px", flex:1 }}>
+          {rows === null ? (
+            <>
+              <div style={{ fontSize:13, color:"#b8cfe0", marginBottom:10, lineHeight:1.6 }}>
+                In Jira, open the ticket → <b>Export → XML</b>, then copy the page and paste it here. You can paste several tickets (a list export) at once.
+              </div>
+              <textarea value={raw} onChange={e => setRaw(e.target.value)} placeholder="Paste the Jira XML here…"
+                style={{ ...iStyle, minHeight:220, fontFamily:"'DM Mono',monospace", whiteSpace:"pre", resize:"vertical" }} />
+              {error && <div style={{ marginTop:10, padding:"8px 12px", background:"#2a1010", border:"1px solid #ef444455", borderRadius:7, fontSize:13, color:"#fca5a5" }}>{error}</div>}
+            </>
+          ) : (
+            <>
+              <div style={{ fontSize:13, color:"#b8cfe0", marginBottom:12 }}>
+                Found <b style={{ color:"#f0f4ff" }}>{rows.length}</b> ticket{rows.length === 1 ? "" : "s"}. Review and adjust, then import. Assignees/customers not in your team will be created.
+              </div>
+              <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+                {rows.map((r, i) => {
+                  const dup = existingIds.has(r.id);
+                  const newMember = r.assignee && !memberNames.includes(r.assignee);
+                  return (
+                    <div key={i} style={{ border:`1px solid ${r.include ? "#2d3f55" : "#1b2433"}`, borderRadius:9, padding:"12px 14px", opacity:r.include ? 1 : 0.5, background:"var(--bg-inset,#0f1a2e)" }}>
+                      <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:10 }}>
+                        <input type="checkbox" checked={r.include} onChange={e => setRow(i, { include:e.target.checked })} style={{ accentColor:"#5b9cf6", cursor:"pointer" }} />
+                        <span style={{ fontSize:13, fontWeight:700, color:"#6baaf8" }}>{r.id || "(no key)"}</span>
+                        {dup && <span style={{ fontSize:11, color:"#fbbf24", border:"1px solid #fbbf2455", borderRadius:4, padding:"1px 6px" }}>exists · will overwrite</span>}
+                        <span style={{ flex:1 }} />
+                        <StatusBadge status={r.status} />
+                      </div>
+                      <div style={{ display:"grid", gridTemplateColumns:"2fr 1fr 1fr", gap:8 }}>
+                        <div style={{ gridColumn:"1/-1" }}><label style={lStyle}>SUMMARY</label><input value={r.summary} onChange={e => setRow(i, { summary:e.target.value })} style={iStyle} /></div>
+                        <div>
+                          <label style={lStyle}>ASSIGNEE{newMember ? " (new)" : ""}</label>
+                          <select value={r.assignee} onChange={e => setRow(i, { assignee:e.target.value })} style={{ ...iStyle, cursor:"pointer" }}>
+                            {newMember && <option value={r.assignee}>{r.assignee} (new)</option>}
+                            {memberNames.map(m => <option key={m} value={m}>{m}</option>)}
+                          </select>
+                        </div>
+                        <div><label style={lStyle}>CUSTOMER</label><input value={r.customer} onChange={e => setRow(i, { customer:e.target.value })} style={iStyle} /></div>
+                        <div><label style={lStyle}>MAN-DAYS</label><input type="number" min="0.25" step="0.25" value={r.manDays} onChange={e => setRow(i, { manDays:e.target.value })} style={iStyle} /></div>
+                        <div>
+                          <label style={lStyle}>STATUS</label>
+                          <select value={r.status} onChange={e => setRow(i, { status:e.target.value })} style={{ ...iStyle, cursor:"pointer" }}>
+                            {Object.keys(STATUS_CONFIG).map(s => <option key={s}>{s}</option>)}
+                          </select>
+                        </div>
+                        <div>
+                          <label style={lStyle}>PRIORITY</label>
+                          <select value={r.priority} onChange={e => setRow(i, { priority:e.target.value })} style={{ ...iStyle, cursor:"pointer" }}>
+                            {Object.keys(PRIORITY_CONFIG).map(p => <option key={p}>{p}</option>)}
+                          </select>
+                        </div>
+                        <div><label style={lStyle}>START DATE</label><input type="date" value={r.startDate} onChange={e => setRow(i, { startDate:e.target.value })} style={{ ...iStyle, colorScheme:"dark" }} /></div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+        </div>
+
+        <div style={{ display:"flex", gap:10, justifyContent:"space-between", alignItems:"center", padding:"16px 24px", borderTop:"1px solid var(--border,#2d3f55)", flexShrink:0 }}>
+          <button onClick={onClose} style={{ padding:"10px 22px", borderRadius:8, border:"1px solid var(--border,#2d3f55)", background:"transparent", color:"var(--fg-muted,#b8cfe0)", fontFamily:"inherit", fontWeight:700, fontSize:14, cursor:"pointer" }}>CANCEL</button>
+          {rows === null ? (
+            <button onClick={parse} disabled={!raw.trim()} style={{ padding:"10px 26px", borderRadius:8, border:"none", background:raw.trim() ? "#5b9cf6" : "var(--border,#2d3f55)", color:raw.trim() ? "#fff" : "#94b4cc", fontFamily:"inherit", fontWeight:700, fontSize:14, cursor:raw.trim() ? "pointer" : "not-allowed" }}>PARSE</button>
+          ) : (
+            <div style={{ display:"flex", gap:10 }}>
+              <button onClick={() => { setRows(null); setError(""); }} style={{ padding:"10px 18px", borderRadius:8, border:"1px solid var(--border,#2d3f55)", background:"transparent", color:"var(--fg-muted,#b8cfe0)", fontFamily:"inherit", fontWeight:700, fontSize:14, cursor:"pointer" }}>← BACK</button>
+              <button onClick={() => onImport(selected)} disabled={selected.length === 0} style={{ padding:"10px 26px", borderRadius:8, border:"none", background:selected.length ? "#3dd68c" : "var(--border,#2d3f55)", color:selected.length ? "#0b0f1c" : "#94b4cc", fontFamily:"inherit", fontWeight:700, fontSize:14, cursor:selected.length ? "pointer" : "not-allowed" }}>IMPORT {selected.length || ""} TASK{selected.length === 1 ? "" : "S"}</button>
+            </div>
+          )}
         </div>
       </div>
     </div>
