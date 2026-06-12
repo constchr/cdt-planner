@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useCallback, useEffect, createContext, useContext } from "react";
+import { useState, useMemo, useRef, useCallback, useEffect, useSyncExternalStore, createContext, useContext } from "react";
 import { createClient } from "@supabase/supabase-js";
 
 // ─── Supabase ─────────────────────────────────────────────────────────────────
@@ -32,27 +32,149 @@ function dbTask(t) {
   };
 }
 
+// ─── Toast / notification bus ─────────────────────────────────────────────────
+// Module-level pub/sub so non-React code (the db helpers) can raise UI toasts.
+const toastListeners = new Set();
+let _toastSeq = 0;
+const toast = {
+  emit(t) {
+    const full = { id: ++_toastSeq, type: "info", duration: 4000, ...t };
+    toastListeners.forEach(fn => fn(full));
+    return full.id;
+  },
+  info(message, opts)    { return toast.emit({ ...opts, message, type: "info" }); },
+  success(message, opts) { return toast.emit({ ...opts, message, type: "success" }); },
+  error(message, opts)   { return toast.emit({ duration: 7000, ...opts, message, type: "error" }); },
+  subscribe(fn) { toastListeners.add(fn); return () => toastListeners.delete(fn); },
+};
+
+// Every db helper surfaces failures as a toast instead of silently swallowing
+// them. Reads return null on failure (so callers can show a retry); writes
+// return a boolean so callers can roll back optimistic UI updates.
 const db = {
   // Tasks
-  async getTasks()        { const {data} = await supabase.from("tasks").select("*").order("created_at"); return (data||[]).map(appTask); },
-  async upsertTask(t)     { await supabase.from("tasks").upsert(dbTask(t)); },
-  async deleteTask(id)    { await supabase.from("tasks").delete().eq("id", id); },
+  async getTasks() {
+    const { data, error } = await supabase.from("tasks").select("*").order("created_at");
+    if (error) { toast.error("Couldn't load tasks: " + error.message); return null; }
+    return (data || []).map(appTask);
+  },
+  async upsertTask(t) {
+    const { error } = await supabase.from("tasks").upsert(dbTask(t));
+    if (error) { toast.error(`Couldn't save ${t.id}: ` + error.message); return false; }
+    return true;
+  },
+  async deleteTask(id) {
+    const { error } = await supabase.from("tasks").delete().eq("id", id);
+    if (error) { toast.error("Couldn't delete task: " + error.message); return false; }
+    return true;
+  },
   // Members
-  async getMembers()      { const {data} = await supabase.from("members").select("*").order("sort_order"); return data||[]; },
-  async upsertMember(m)   { await supabase.from("members").upsert(m); },
-  async deleteMember(n)   { await supabase.from("members").delete().eq("name", n); },
+  async getMembers() {
+    const { data, error } = await supabase.from("members").select("*").order("sort_order");
+    if (error) { toast.error("Couldn't load members: " + error.message); return null; }
+    return data || [];
+  },
+  async upsertMember(m) {
+    const { error } = await supabase.from("members").upsert(m);
+    if (error) { toast.error(`Couldn't save ${m.name}: ` + error.message); return false; }
+    return true;
+  },
+  async deleteMember(n) {
+    const { error } = await supabase.from("members").delete().eq("name", n);
+    if (error) { toast.error("Couldn't remove member: " + error.message); return false; }
+    return true;
+  },
   // Customers
-  async getCustomers()    { const {data} = await supabase.from("customers").select("name").order("name"); return (data||[]).map(r=>r.name); },
-  async upsertCustomer(n) { await supabase.from("customers").upsert({name:n}); },
+  async getCustomers() {
+    const { data, error } = await supabase.from("customers").select("name").order("name");
+    if (error) { toast.error("Couldn't load customers: " + error.message); return null; }
+    return (data || []).map(r => r.name);
+  },
+  async upsertCustomer(n) {
+    const { error } = await supabase.from("customers").upsert({ name: n });
+    if (error) { toast.error("Couldn't save customer: " + error.message); return false; }
+    return true;
+  },
   // Reports
-  async getReports()      { const {data} = await supabase.from("reports").select("*").order("created_at",{ascending:false}); return (data||[]).map(r=>({id:r.id,date:r.date,isoDate:r.iso_date,notes:r.notes,snapshot:r.snapshot})); },
-  async insertReport(r)   { await supabase.from("reports").insert({id:r.id,date:r.date,iso_date:r.isoDate,notes:r.notes,snapshot:r.snapshot}); },
-  async deleteReport(id)  { await supabase.from("reports").delete().eq("id", id); },
+  async getReports() {
+    const { data, error } = await supabase.from("reports").select("*").order("created_at", { ascending: false });
+    if (error) { toast.error("Couldn't load reports: " + error.message); return null; }
+    return (data || []).map(r => ({ id: r.id, date: r.date, isoDate: r.iso_date, notes: r.notes, snapshot: r.snapshot }));
+  },
+  async insertReport(r) {
+    const { error } = await supabase.from("reports").insert({ id: r.id, date: r.date, iso_date: r.isoDate, notes: r.notes, snapshot: r.snapshot });
+    if (error) { toast.error("Couldn't save report: " + error.message); return false; }
+    return true;
+  },
+  async deleteReport(id) {
+    const { error } = await supabase.from("reports").delete().eq("id", id);
+    if (error) { toast.error("Couldn't delete report: " + error.message); return false; }
+    return true;
+  },
   // Profiles
-  async getProfile(uid)   { const {data} = await supabase.from("profiles").select("*").eq("id",uid).single(); return data; },
-  async upsertProfile(p)  { await supabase.from("profiles").upsert(p); },
-  async getProfiles()     { const {data} = await supabase.from("profiles").select("*"); return data||[]; },
+  async getProfile(uid) {
+    const { data, error } = await supabase.from("profiles").select("*").eq("id", uid).single();
+    if (error) { console.error("getProfile:", error.message); return null; }
+    return data;
+  },
+  async upsertProfile(p) {
+    const { error } = await supabase.from("profiles").upsert(p);
+    if (error) { console.error("upsertProfile:", error.message); return false; }
+    return true;
+  },
+  async getProfiles() {
+    const { data, error } = await supabase.from("profiles").select("*");
+    if (error) { toast.error("Couldn't load accounts: " + error.message); return []; }
+    return data || [];
+  },
 };
+
+// ─── Small shared hooks/components ─────────────────────────────────────────────
+
+// Tracks a CSS media query (used for the mobile schedule view).
+function useMediaQuery(query) {
+  return useSyncExternalStore(
+    callback => {
+      const mq = window.matchMedia(query);
+      mq.addEventListener("change", callback);
+      return () => mq.removeEventListener("change", callback);
+    },
+    () => window.matchMedia(query).matches,
+    () => false, // server snapshot
+  );
+}
+
+// Renders the live toast stack (errors, success, undo prompts).
+function ToastHost() {
+  const [items, setItems] = useState([]);
+  useEffect(() => toast.subscribe(t => {
+    setItems(prev => [...prev, t]);
+    if (t.duration > 0) setTimeout(() => setItems(prev => prev.filter(x => x.id !== t.id)), t.duration);
+  }), []);
+  const dismiss = id => setItems(prev => prev.filter(x => x.id !== id));
+  const palette = {
+    error:   { bg: "#2a1010", border: "#ef4444", fg: "#fbb4b4" },
+    success: { bg: "#0d3328", border: "#3dd68c", fg: "#86efac" },
+    info:    { bg: "#0d1a2e", border: "#4F8EF7", fg: "#cfe0f5" },
+  };
+  return (
+    <div style={{ position: "fixed", bottom: 18, right: 18, zIndex: 9999, display: "flex", flexDirection: "column", gap: 8, maxWidth: "min(380px,92vw)" }}>
+      {items.map(t => {
+        const c = palette[t.type] || palette.info;
+        return (
+          <div key={t.id} style={{ background: c.bg, border: `1px solid ${c.border}`, borderRadius: 9, padding: "11px 14px", display: "flex", alignItems: "center", gap: 12, boxShadow: "0 8px 28px rgba(0,0,0,0.45)", fontFamily: "'DM Mono','Fira Mono',monospace", animation: "cdtToastIn 0.18s ease-out" }}>
+            <div style={{ flex: 1, fontSize: 13, color: c.fg, lineHeight: 1.5 }}>{t.message}</div>
+            {t.action && (
+              <button onClick={() => { t.action(); dismiss(t.id); }} style={{ background: "transparent", border: `1px solid ${c.border}`, color: c.border, borderRadius: 6, padding: "4px 10px", fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}>{t.actionLabel || "Undo"}</button>
+            )}
+            <button onClick={() => dismiss(t.id)} style={{ background: "none", border: "none", color: c.fg, opacity: 0.6, cursor: "pointer", fontSize: 16, fontFamily: "inherit", lineHeight: 1 }}>×</button>
+          </div>
+        );
+      })}
+      <style>{`@keyframes cdtToastIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }`}</style>
+    </div>
+  );
+}
 
 // ─── Login Screen ─────────────────────────────────────────────────────────────
 
@@ -387,6 +509,54 @@ function StatusBadge({ status }) {
   );
 }
 
+// Full-screen centered wrapper used by the loading / status screens.
+function Centered({ children }) {
+  return (
+    <div style={{ height:"100vh", width:"100vw", background:"#0b0f1c", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:16, fontFamily:"'Inter',sans-serif" }}>{children}</div>
+  );
+}
+function Loading({ msg }) {
+  return (
+    <Centered>
+      <div style={{ fontSize:34 }}>⚡</div>
+      <div style={{ fontSize:15, fontWeight:700, color:"#f0f4ff" }}>CDT PLANNER</div>
+      <div style={{ fontSize:13, color:"#6b84a0" }}>{msg}</div>
+    </Centered>
+  );
+}
+
+// Friendly placeholder for empty lists / first-run states.
+function EmptyState({ icon, title, hint, action }) {
+  return (
+    <div style={{ padding: "40px 28px", textAlign: "center", background: "#111827", borderRadius: 12, border: "1px dashed #2d3f55" }}>
+      <div style={{ fontSize: 34, marginBottom: 10 }}>{icon}</div>
+      <div style={{ fontSize: 16, fontWeight: 700, color: "#f0f4ff", marginBottom: 6 }}>{title}</div>
+      {hint && <div style={{ fontSize: 13, color: "#b8cfe0", maxWidth: 420, margin: "0 auto", lineHeight: 1.6 }}>{hint}</div>}
+      {action && (
+        <button onClick={action.onClick} style={{ marginTop: 16, padding: "9px 18px", borderRadius: 8, border: "none", background: "#4F8EF7", color: "#fff", fontFamily: "inherit", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+          {action.label}
+        </button>
+      )}
+    </div>
+  );
+}
+
+// Live/offline indicator for the realtime channel.
+function ConnDot({ status }) {
+  const cfg = {
+    connecting: { c: "#fbbf24", t: "Connecting…" },
+    live:       { c: "#3dd68c", t: "Live — changes sync in real time" },
+    error:      { c: "#ef4444", t: "Connection problem — you may see stale data" },
+    offline:    { c: "#6b84a0", t: "Offline" },
+  }[status] || { c: "#6b84a0", t: status };
+  return (
+    <span title={cfg.t} style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11, color: cfg.c }}>
+      <span style={{ width: 8, height: 8, borderRadius: "50%", background: cfg.c, boxShadow: `0 0 6px ${cfg.c}`, animation: status === "live" ? "cdtPulse 2s infinite" : "none" }} />
+      <style>{`@keyframes cdtPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }`}</style>
+    </span>
+  );
+}
+
 // ─── Gantt Chart ─────────────────────────────────────────────────────────────
 
 function GanttChart({ enriched, members, memberColors, memberNames, onMoveTask, onDropTask, onAddTask, onEditTask }) {
@@ -704,10 +874,26 @@ function GanttChart({ enriched, members, memberColors, memberNames, onMoveTask, 
                     <div
                       key={task.id}
                       draggable
+                      tabIndex={0}
+                      role="button"
+                      aria-label={`${task.id} ${task.summary}, starts ${task.startDate}, due ${fmtDate(task.dueDate)}. Arrow keys to reschedule, Enter to edit.`}
                       onDragStart={e => onBarDragStart(e, task, ti)}
                       onDragEnd={onBarDragEnd}
                       onClick={e => { e.stopPropagation(); if (!dragRef.current) onEditTask && onEditTask(task); }}
-                      title={`${task.id}: ${task.summary}\nStart: ${task.startDate}\nDue: ${fmtDate(task.dueDate)}\n${task.manDays}md · FTE ${members[task.assignee]?.fte} · ${task.efficiencyPct}% eff`}
+                      onKeyDown={e => {
+                        if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+                          e.preventDefault();
+                          const d = toDate(task.startDate);
+                          d.setDate(d.getDate() + (e.key === "ArrowLeft" ? -1 : 1));
+                          onMoveTask(task.id, toISO(d), null);
+                        } else if (e.key === "Enter") {
+                          e.preventDefault();
+                          onEditTask && onEditTask(task);
+                        }
+                      }}
+                      onFocus={e => e.currentTarget.style.boxShadow = `0 0 0 2px ${color}`}
+                      onBlur={e => e.currentTarget.style.boxShadow = "none"}
+                      title={`${task.id}: ${task.summary}\nStart: ${task.startDate}\nDue: ${fmtDate(task.dueDate)}\n${task.manDays}md · FTE ${members[task.assignee]?.fte} · ${task.efficiencyPct}% eff\n← → to reschedule · Enter to edit`}
                       style={{
                         position: "absolute",
                         left: barLeft, top: barTop,
@@ -781,9 +967,59 @@ function GanttChart({ enriched, members, memberColors, memberNames, onMoveTask, 
         <div style={{ fontSize: 13, color: "#b8cfe0", display: "flex", alignItems: "center", gap: 5 }}>
           <div style={{ width: 16, height: 8, borderRadius: 2, background: "repeating-linear-gradient(45deg,transparent,transparent 3px,rgba(0,0,0,0.5) 3px,rgba(0,0,0,0.5) 4px)", border: "1px solid #8ba0b8" }} /> Buffer days
         </div>
-        <div style={{ fontSize: 13, color: "#b8cfe0" }}>Drag bars to reschedule · Drop onto a member row to reassign</div>
+        <div style={{ fontSize: 13, color: "#b8cfe0" }}>Drag bars to reschedule · drop onto a member row to reassign · click to edit · ← → keys nudge a focused bar</div>
       </div>
     </div>
+  );
+}
+
+// ─── Schedule list view (mobile fallback for the Gantt) ───────────────────────
+
+function ScheduleListView({ enriched, memberNames, memberColors, onEditTask }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      {memberNames.map(member => {
+        const color = memberColors[member];
+        const mTasks = enriched
+          .filter(t => t.assignee === member)
+          .sort((a, b) => (a.startDate || "").localeCompare(b.startDate || ""));
+        return (
+          <div key={member}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+              <div style={{ width: 26, height: 26, borderRadius: "50%", background: color + "22", border: `2px solid ${color}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 700, color }}>{initials(member)}</div>
+              <div style={{ fontSize: 15, fontWeight: 700, color: "#f1f5f9" }}>{member}</div>
+              <div style={{ fontSize: 12, color: "#6b84a0" }}>{mTasks.length} task{mTasks.length === 1 ? "" : "s"}</div>
+            </div>
+            {mTasks.length === 0 ? (
+              <div style={{ fontSize: 13, color: "#6b84a0", paddingLeft: 34, marginBottom: 4 }}>No tasks</div>
+            ) : mTasks.map(t => {
+              const overdue = isOverdue(t.dueDate) && t.status !== "Done";
+              return (
+                <div key={t.id} onClick={() => onEditTask && onEditTask(t)}
+                  style={{ background: "#111827", border: `1px solid ${color}33`, borderLeft: `3px solid ${color}`, borderRadius: 8, padding: "10px 12px", marginBottom: 6, cursor: onEditTask ? "pointer" : "default" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline" }}>
+                    <span style={{ fontSize: 14, color: "#eaf0f6", fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.summary}</span>
+                    <StatusBadge status={t.status} />
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 6, fontSize: 12 }}>
+                    <span style={{ color: "#6b84a0" }}>{t.id} · {t.manDays}md</span>
+                    <span style={{ fontWeight: 700, color: overdue ? "#ef4444" : t.status === "Done" ? "#4FD4A0" : "#F7D44F" }}>due {fmtDate(t.dueDate)}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// True if any status-call note has been typed but not yet saved to a report.
+function notesHaveContent(notes) {
+  return Object.values(notes || {}).some(n =>
+    Object.values(n.taskNotes || {}).some(v => v && v.trim()) ||
+    (n.extraItems || []).some(x => x.text && x.text.trim())
   );
 }
 
@@ -798,13 +1034,30 @@ function PlannerApp({ initData, onLogout }) {
   const [members, setMembersRaw]   = useState(initData.members);
   const [customers, setCustomersRaw] = useState(initData.customers);
   const [savedReports, setSavedReportsRaw] = useState(initData.reports);
-  const [view, setView]            = useState("workload");
+  const [view, setViewRaw]         = useState("workload");
   const [selectedMember, setSelectedMember] = useState(null);
+  const [taskSearch, setTaskSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("All");
+  const isMobile = useMediaQuery("(max-width: 480px)");
 
   // statusNotes: { [memberName]: { taskNotes: { [taskId]: string }, extraItems: [{id, text}] } }
   const [statusNotes, setStatusNotes] = useState({});
   const [addTaskModal, setAddTaskModal] = useState({ open: false, assignee: "", startDate: toISO(new Date()) });
   const [editTaskModal, setEditTaskModal] = useState({ open: false, task: null });
+
+  // Guard against losing unsaved Status Call notes when navigating or closing.
+  const hasUnsavedNotes = useMemo(() => notesHaveContent(statusNotes), [statusNotes]);
+  useEffect(() => {
+    if (!hasUnsavedNotes) return;
+    const handler = e => { e.preventDefault(); e.returnValue = ""; };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [hasUnsavedNotes]);
+  function setView(id) {
+    if (view === "standup" && id !== "standup" && hasUnsavedNotes &&
+        !window.confirm("You have unsaved status notes. Leave without saving them to a report?")) return;
+    setViewRaw(id);
+  }
 
   // Supabase-backed setters
   function setTasks(v) {
@@ -846,6 +1099,7 @@ function PlannerApp({ initData, onLogout }) {
   // Own writes echo back here too and simply reconcile to the server value.
   // (Subscription lives here — not in Root — because Root passes tasks to this
   // component only once at mount, so updates must land on this component's state.)
+  const [rtStatus, setRtStatus] = useState("connecting");
   useEffect(() => {
     const ch = supabase.channel("tasks-rt")
       .on("postgres_changes", { event: "*", schema: "public", table: "tasks" }, payload => {
@@ -858,7 +1112,11 @@ function PlannerApp({ initData, onLogout }) {
             : [...prev, incoming];
         });
       })
-      .subscribe();
+      .subscribe(status => {
+        if (status === "SUBSCRIBED")        setRtStatus("live");
+        else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") setRtStatus("error");
+        else if (status === "CLOSED")       setRtStatus("offline");
+      });
     return () => supabase.removeChannel(ch);
   }, []);
 
@@ -918,41 +1176,68 @@ function PlannerApp({ initData, onLogout }) {
     });
   }
   function updateMember(name, field, val) { setMembers(p => ({ ...p, [name]: { ...p[name], [field]: val } })); }
-  function updateStatus(id, status) {
+
+  // Seed the demo dataset (admin only) — used from the empty state.
+  function loadSampleData() {
+    const seededMembers = {};
+    Object.entries(INITIAL_MEMBERS).forEach(([name, cfg], i) => {
+      seededMembers[name] = { fte: cfg.fte, sort_order: i };
+      db.upsertMember({ name, fte: cfg.fte, sort_order: i });
+    });
+    INITIAL_TASKS.forEach(t => db.upsertTask(t));
+    setMembersRaw(seededMembers);
+    setTasksRaw(INITIAL_TASKS);
+    toast.success("Sample data loaded");
+  }
+
+  // Optimistically apply a task patch, persist it, and roll back on failure.
+  async function persistTaskUpdate(id, patch) {
     const task = tasks.find(t => t.id === id);
     if (!task) return;
-    const updated = { ...task, status };
-    db.upsertTask(updated);
+    const updated = { ...task, ...patch };
     setTasks(p => p.map(t => t.id === id ? updated : t));
+    const ok = await db.upsertTask(updated);
+    if (!ok) setTasks(p => p.map(t => t.id === id ? task : t)); // revert just this task
+    return ok;
   }
-  function updateField(id, field, val) {
+  function updateStatus(id, status) { persistTaskUpdate(id, { status }); }
+  function updateField(id, field, val) { persistTaskUpdate(id, { [field]: val }); }
+
+  async function deleteTask(id) {
     const task = tasks.find(t => t.id === id);
     if (!task) return;
-    const updated = { ...task, [field]: val };
-    db.upsertTask(updated);
-    setTasks(p => p.map(t => t.id === id ? updated : t));
-  }
-  function deleteTask(id) {
-    db.deleteTask(id);
-    setTasks(p => p.filter(t => t.id !== id));
+    setTasks(p => p.filter(t => t.id !== id));            // optimistic remove
+    const ok = await db.deleteTask(id);
+    if (!ok) { setTasks(p => p.some(t => t.id === id) ? p : [...p, task]); return; } // rollback
+    toast.emit({
+      type: "success", message: `Deleted ${task.id}`, duration: 6000, actionLabel: "Undo",
+      action: () => { db.upsertTask(task); setTasks(p => p.some(t => t.id === task.id) ? p : [...p, task]); },
+    });
   }
 
   // Gantt: move task start date
   function handleMoveTask(taskId, newStartDate, newAssignee) {
-    const task = tasks.find(t => t.id === taskId);
-    if (!task) return;
-    const updated = { ...task, startDate: newStartDate || task.startDate, assignee: newAssignee || task.assignee };
-    db.upsertTask(updated);
-    setTasks(p => p.map(t => t.id === taskId ? updated : t));
+    const patch = {};
+    if (newStartDate) patch.startDate = newStartDate;
+    if (newAssignee)  patch.assignee = newAssignee;
+    persistTaskUpdate(taskId, patch);
   }
 
   // Gantt: drop onto member row → reassign (and optionally shift start date)
-  function handleDropTask(taskId, memberName, newStartDate) {
+  async function handleDropTask(taskId, memberName, newStartDate) {
     const task = tasks.find(t => t.id === taskId);
     if (!task) return;
-    const updated = { ...task, assignee: memberName, ...(newStartDate ? { startDate: newStartDate } : {}) };
-    db.upsertTask(updated);
-    setTasks(p => p.map(t => t.id === taskId ? updated : t));
+    const prevAssignee = task.assignee, prevStart = task.startDate;
+    const ok = await persistTaskUpdate(taskId, {
+      assignee: memberName,
+      ...(newStartDate ? { startDate: newStartDate } : {}),
+    });
+    if (ok && prevAssignee !== memberName) {
+      toast.emit({
+        type: "info", message: `Moved ${task.id} → ${memberName}`, duration: 6000, actionLabel: "Undo",
+        action: () => persistTaskUpdate(taskId, { assignee: prevAssignee, startDate: prevStart }),
+      });
+    }
   }
 
   function saveReport() {
@@ -1077,7 +1362,10 @@ function PlannerApp({ initData, onLogout }) {
             display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18,
           }}>⚡</div>
           <div>
-            <div style={{ fontSize: 16, fontWeight: 700, letterSpacing: "0.06em", color: "#f8fafc" }}>CDT PLANNER</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{ fontSize: 16, fontWeight: 700, letterSpacing: "0.06em", color: "#f8fafc" }}>CDT PLANNER</div>
+              <ConnDot status={rtStatus} />
+            </div>
             <div style={{ display: "flex", gap: 5, marginTop: 2, flexWrap: "wrap" }}>
               <StatChip label="tasks" value={tasks.length} />
               <StatChip label={auth?.role} value={auth?.memberName} color={auth?.role === "admin" ? "#a16ef5" : "#5b9cf6"} accent={auth?.role === "admin" ? "#a16ef5" : "#5b9cf6"} />
@@ -1099,7 +1387,20 @@ function PlannerApp({ initData, onLogout }) {
       <div className="cdt-content">
 
         {/* ══ WORKLOAD ══ */}
-        {view === "workload" && (
+        {view === "workload" && memberNames.length === 0 && (
+          <div>
+            <ViewHeader label="WORKLOAD" accent="#4F8EF7" title="Team Workload & Utilization" />
+            <EmptyState
+              icon="👋"
+              title="Welcome to CDT Planner"
+              hint={isAdmin
+                ? "Get started by adding team members in the Team tab, then schedule their tasks. Or load a sample dataset to explore the features first."
+                : "Your team hasn't been set up yet. Once an admin adds members and tasks, your workload will appear here."}
+              action={isAdmin ? { label: "Load sample data", onClick: loadSampleData } : null}
+            />
+          </div>
+        )}
+        {view === "workload" && memberNames.length > 0 && (
           <div>
             <ViewHeader label="WORKLOAD" accent="#4F8EF7" title="Team Workload & Utilization" />
 
@@ -1165,18 +1466,57 @@ function PlannerApp({ initData, onLogout }) {
                 </div>
               ))}
             </div>
-            <div style={{ fontSize: 13, color: "#b8cfe0", letterSpacing: "0.1em", marginBottom: 10 }}>
-              {selectedMember ? `${selectedMember.toUpperCase()}'S TASKS` : "ALL TASKS"}
-            </div>
-            <SimpleTaskTable
-              tasks={selectedMember
+            {(() => {
+              const baseTasks = selectedMember
                 ? enriched.filter(t => t.assignee === selectedMember)
-                : isAdmin ? enriched : enriched.filter(t => t.assignee === myName)}
-              onStatusChange={isAdmin ? updateStatus : () => {}}
-              onDelete={isAdmin ? deleteTask : () => {}}
-              memberColors={memberColors}
-              readOnly={!isAdmin}
-            />
+                : isAdmin ? enriched : enriched.filter(t => t.assignee === myName);
+              const q = taskSearch.trim().toLowerCase();
+              const visibleTasks = baseTasks.filter(t => {
+                if (statusFilter !== "All" && t.status !== statusFilter) return false;
+                if (!q) return true;
+                return [t.summary, t.id, t.assignee, t.customer].some(v => (v || "").toLowerCase().includes(q));
+              });
+              return (
+                <>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
+                    <div style={{ fontSize: 13, color: "#b8cfe0", letterSpacing: "0.1em" }}>
+                      {selectedMember ? `${selectedMember.toUpperCase()}'S TASKS` : "ALL TASKS"}
+                    </div>
+                    <div style={{ flex: 1 }} />
+                    <input
+                      value={taskSearch}
+                      onChange={e => setTaskSearch(e.target.value)}
+                      placeholder="Search tasks…"
+                      style={{ ...inputStyle, width: "min(220px, 50vw)", padding: "7px 10px", fontSize: 13 }}
+                    />
+                    <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}
+                      style={{ ...inputStyle, width: 130, padding: "7px 10px", fontSize: 13, cursor: "pointer" }}>
+                      <option value="All">All statuses</option>
+                      {Object.keys(STATUS_CONFIG).map(s => <option key={s} value={s}>{s}</option>)}
+                    </select>
+                  </div>
+                  {baseTasks.length === 0 ? (
+                    <EmptyState
+                      icon="📋"
+                      title="No tasks yet"
+                      hint={isAdmin ? "Add your first task from the Schedule tab, or load sample data to explore." : "Tasks assigned to you will show up here."}
+                      action={isAdmin && memberNames.length > 0 ? { label: "Load sample data", onClick: loadSampleData } : null}
+                    />
+                  ) : visibleTasks.length === 0 ? (
+                    <EmptyState icon="🔎" title="No matching tasks" hint="Try a different search or status filter." />
+                  ) : (
+                    <SimpleTaskTable
+                      tasks={visibleTasks}
+                      onStatusChange={isAdmin ? updateStatus : () => {}}
+                      onDelete={isAdmin ? deleteTask : () => {}}
+                      onEdit={isAdmin ? (task => setEditTaskModal({ open: true, task })) : null}
+                      memberColors={memberColors}
+                      readOnly={!isAdmin}
+                    />
+                  )}
+                </>
+              );
+            })()}
           </div>
         )}
 
@@ -1184,70 +1524,41 @@ function PlannerApp({ initData, onLogout }) {
         {view === "schedule" && (
           <div>
             <ViewHeader label="SCHEDULE" accent="#F7D44F" title="Timeline by Person" />
-            <div style={{ marginBottom: 14, fontSize: 14, color: "#b8cfe0", lineHeight: 1.7 }}>
-              <span style={{ color: "#F7D44F" }}>Formula: </span>
-              working days = ⌈MD × (1/FTE) × (100/Eff%)⌉ + buffer (skipping weekends) · due = next Friday after last day
-            </div>
-            <GanttChart
-              enriched={enriched}
-              members={members}
-              memberColors={memberColors}
-              memberNames={memberNames}
-              onMoveTask={handleMoveTask}
-              onDropTask={handleDropTask}
-              onAddTask={(memberName, startDate) => {
-                setAddTaskModal({ open: true, assignee: memberName, startDate });
-              }}
-              onEditTask={(task) => setEditTaskModal({ open: true, task })}
-            />
-
-            {/* Add Task Modal */}
-            {addTaskModal.open && (
-              <AddTaskModal
-                initialAssignee={addTaskModal.assignee}
-                initialStartDate={addTaskModal.startDate}
-                memberNames={memberNames}
-                members={members}
-                customers={customers}
-                onAddCustomer={addCustomer}
-                onSave={(task) => {
-                  const id = task.id || `T-${Date.now()}`;
-                  const newTask = { ...task, id,
-                    manDays: parseFloat(task.manDays) || 1,
-                    efficiencyPct: parseFloat(task.efficiencyPct) || 100,
-                    bufferDays: parseInt(task.bufferDays) || 0,
-                  };
-                  addMemberIfNew(task.assignee);
-                  db.upsertTask(newTask); setTasks(p => [...p, newTask]);
-                  setAddTaskModal({ open: false, assignee: "", startDate: toISO(new Date()) });
-                }}
-                onClose={() => setAddTaskModal({ open: false, assignee: "", startDate: toISO(new Date()) })}
+            {memberNames.length === 0 ? (
+              <EmptyState
+                icon="🗓️"
+                title="No team members yet"
+                hint={isAdmin ? "Add members in the Team tab, then schedule their tasks here." : "Once an admin sets up the team and tasks, your timeline appears here."}
+                action={isAdmin ? { label: "Go to Team tab", onClick: () => setView("team") } : null}
               />
-            )}
-
-            {/* Edit Task Modal */}
-            {editTaskModal.open && editTaskModal.task && (
-              <EditTaskModal
-                task={editTaskModal.task}
-                memberNames={memberNames}
-                members={members}
-                customers={customers}
-                onAddCustomer={addCustomer}
-                onSave={(updated) => {
-                  const saved = { ...updated,
-                    manDays: parseFloat(updated.manDays) || 1,
-                    efficiencyPct: parseFloat(updated.efficiencyPct) || 100,
-                    bufferDays: parseInt(updated.bufferDays) || 0,
-                  };
-                  db.upsertTask(saved); setTasks(p => p.map(t => t.id === saved.id ? { ...t, ...saved } : t));
-                  setEditTaskModal({ open: false, task: null });
-                }}
-                onDelete={(id) => {
-                  db.deleteTask(id); setTasks(p => p.filter(t => t.id !== id));
-                  setEditTaskModal({ open: false, task: null });
-                }}
-                onClose={() => setEditTaskModal({ open: false, task: null })}
-              />
+            ) : (
+              <>
+                <div style={{ marginBottom: 14, fontSize: 14, color: "#b8cfe0", lineHeight: 1.7 }}>
+                  <span style={{ color: "#F7D44F" }}>Formula: </span>
+                  working days = ⌈MD × (1/FTE) × (100/Eff%)⌉ + buffer (skipping weekends) · due = next Friday after last day
+                </div>
+                {isMobile ? (
+                  <ScheduleListView
+                    enriched={enriched}
+                    memberNames={memberNames}
+                    memberColors={memberColors}
+                    onEditTask={isAdmin ? (task => setEditTaskModal({ open: true, task })) : null}
+                  />
+                ) : (
+                  <GanttChart
+                    enriched={enriched}
+                    members={members}
+                    memberColors={memberColors}
+                    memberNames={memberNames}
+                    onMoveTask={handleMoveTask}
+                    onDropTask={handleDropTask}
+                    onAddTask={(memberName, startDate) => {
+                      setAddTaskModal({ open: true, assignee: memberName, startDate });
+                    }}
+                    onEditTask={(task) => setEditTaskModal({ open: true, task })}
+                  />
+                )}
+              </>
             )}
           </div>
         )}
@@ -1313,8 +1624,56 @@ function PlannerApp({ initData, onLogout }) {
           <AccountsView memberNames={memberNames} />
         )}
 
-
       </div>
+
+      {/* ── Task modals (available from any view) ── */}
+      {addTaskModal.open && (
+        <AddTaskModal
+          initialAssignee={addTaskModal.assignee}
+          initialStartDate={addTaskModal.startDate}
+          memberNames={memberNames}
+          members={members}
+          customers={customers}
+          onAddCustomer={addCustomer}
+          onSave={async (task) => {
+            const id = task.id || `T-${Date.now()}`;
+            const newTask = { ...task, id,
+              manDays: parseFloat(task.manDays) || 1,
+              efficiencyPct: parseFloat(task.efficiencyPct) || 100,
+              bufferDays: parseInt(task.bufferDays) || 0,
+            };
+            addMemberIfNew(task.assignee);
+            setTasks(p => [...p, newTask]);                       // optimistic
+            setAddTaskModal({ open: false, assignee: "", startDate: toISO(new Date()) });
+            const ok = await db.upsertTask(newTask);
+            if (!ok) setTasks(p => p.filter(t => t.id !== id));   // rollback
+          }}
+          onClose={() => setAddTaskModal({ open: false, assignee: "", startDate: toISO(new Date()) })}
+        />
+      )}
+      {editTaskModal.open && editTaskModal.task && (
+        <EditTaskModal
+          task={editTaskModal.task}
+          memberNames={memberNames}
+          members={members}
+          customers={customers}
+          onAddCustomer={addCustomer}
+          onSave={async (updated) => {
+            const saved = { ...updated,
+              manDays: parseFloat(updated.manDays) || 1,
+              efficiencyPct: parseFloat(updated.efficiencyPct) || 100,
+              bufferDays: parseInt(updated.bufferDays) || 0,
+            };
+            const prev = tasks.find(t => t.id === saved.id);
+            setTasks(p => p.map(t => t.id === saved.id ? { ...t, ...saved } : t)); // optimistic
+            setEditTaskModal({ open: false, task: null });
+            const ok = await db.upsertTask(saved);
+            if (!ok && prev) setTasks(p => p.map(t => t.id === saved.id ? prev : t)); // rollback
+          }}
+          onDelete={(id) => { deleteTask(id); setEditTaskModal({ open: false, task: null }); }}
+          onClose={() => setEditTaskModal({ open: false, task: null })}
+        />
+      )}
     </div>
   );
 }
@@ -1610,14 +1969,14 @@ function iconBtn(color) {
 
 // ─── Simple task table (workload view) ───────────────────────────────────────
 
-function SimpleTaskTable({ tasks, onStatusChange, onDelete, memberColors, readOnly = false }) {
+function SimpleTaskTable({ tasks, onStatusChange, onDelete, onEdit, memberColors, readOnly = false }) {
   return (
     <div style={{ background: "#111827", borderRadius: 10, border: "1px solid #2d3f55", overflowX: "auto" }}>
       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14, minWidth: 600 }}>
         <thead>
           <tr style={{ background: "#0b0f1c" }}>
-            {["ID","SUMMARY","ASSIGNEE","CUSTOMER","MD","EFF %","BUF","STATUS","PRIORITY","DUE",""].map(h => (
-              <th key={h} style={{ padding: "8px 10px", textAlign: "left", fontSize: 12, color: "#b8cfe0", letterSpacing: "0.08em", fontWeight: 700, borderBottom: "1px solid #2d3f55", whiteSpace: "nowrap" }}>{h}</th>
+            {["ID","SUMMARY","ASSIGNEE","CUSTOMER","MD","EFF %","BUF","STATUS","PRIORITY","DUE",""].map((h, i) => (
+              <th key={i} style={{ padding: "8px 10px", textAlign: "left", fontSize: 12, color: "#b8cfe0", letterSpacing: "0.08em", fontWeight: 700, borderBottom: "1px solid #2d3f55", whiteSpace: "nowrap" }}>{h}</th>
             ))}
           </tr>
         </thead>
@@ -1652,8 +2011,11 @@ function SimpleTaskTable({ tasks, onStatusChange, onDelete, memberColors, readOn
                 </td>
                 <td style={{ padding: "8px 10px", fontWeight: 700, whiteSpace: "nowrap", color: overdue ? "#ef4444" : t.status === "Done" ? "#4FD4A0" : "#F7D44F" }}>{fmtDate(t.dueDate)}</td>
                 {!readOnly && (
-                  <td style={{ padding: "8px 10px" }}>
-                    <button onClick={() => onDelete(t.id)} style={{ background: "none", border: "none", color: "#94b4cc", cursor: "pointer", fontSize: 17, fontFamily: "inherit" }}>×</button>
+                  <td style={{ padding: "8px 10px", whiteSpace: "nowrap" }}>
+                    {onEdit && (
+                      <button onClick={() => onEdit(t)} title="Edit task" style={{ background: "none", border: "none", color: "#6baaf8", cursor: "pointer", fontSize: 14, fontFamily: "inherit", marginRight: 4 }}>✎</button>
+                    )}
+                    <button onClick={() => onDelete(t.id)} title="Delete task" style={{ background: "none", border: "none", color: "#94b4cc", cursor: "pointer", fontSize: 17, fontFamily: "inherit" }}>×</button>
                   </td>
                 )}
               </tr>
@@ -2236,56 +2598,72 @@ export default function Root() {
     return () => { cancelled = true; };
   }, [session?.user?.id]);
 
-  // Load app data once profile is known and has a role
+  // Load app data once profile is known and has a role.
+  const [loadError, setLoadError] = useState(false);
+  const [loadSlow, setLoadSlow]   = useState(false);
+
+  const loadData = useCallback(async () => {
+    setLoadError(false);
+    const [tasks, memberRows, customers, reports] = await Promise.all([
+      db.getTasks(), db.getMembers(), db.getCustomers(), db.getReports(),
+    ]);
+    // A null result means the fetch failed (db already raised a toast).
+    if (tasks === null || memberRows === null || customers === null || reports === null) {
+      setLoadError(true);
+      return;
+    }
+    const membersMap = {};
+    memberRows.forEach(r => { membersMap[r.name] = { fte: r.fte, sort_order: r.sort_order ?? 0 }; });
+    // No silent demo-data seeding: an empty database yields a real empty state.
+    setAppData({ tasks, members: membersMap, customers, reports });
+  }, []);
+
   useEffect(() => {
     if (!session || !profile?.role) return;
-    async function load() {
-      const [tasks, memberRows, customers, reports] = await Promise.all([
-        db.getTasks(), db.getMembers(), db.getCustomers(), db.getReports(),
-      ]);
-      const membersMap = {};
-      memberRows.forEach(r => { membersMap[r.name] = { fte: r.fte, sort_order: r.sort_order ?? 0 }; });
-      setAppData({
-        tasks:     tasks.length     ? tasks     : INITIAL_TASKS,
-        members:   Object.keys(membersMap).length ? membersMap : INITIAL_MEMBERS,
-        customers: customers.length ? customers : ["Acme Corp","Globex","Initech"],
-        reports,
-      });
-    }
-    load();
-  }, [session, profile]);
+    loadData();
+  }, [session, profile, loadData]);
 
-  const Loading = ({msg}) => (
-    <div style={{ height:"100vh", width:"100vw", background:"#0b0f1c", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:16, fontFamily:"'Inter',sans-serif" }}>
-      <div style={{ fontSize:34 }}>⚡</div>
-      <div style={{ fontSize:15, fontWeight:700, color:"#f0f4ff" }}>CDT PLANNER</div>
-      <div style={{ fontSize:13, color:"#6b84a0" }}>{msg}</div>
-    </div>
-  );
+  // If data hasn't arrived after 10s, surface a manual retry instead of spinning forever.
+  // (loadSlow is never reset to false here — once appData arrives this branch
+  // stops rendering, so a stale true is harmless and avoids a setState-in-effect.)
+  useEffect(() => {
+    if (appData || !session || !profile?.role) return;
+    const id = setTimeout(() => setLoadSlow(true), 10000);
+    return () => clearTimeout(id);
+  }, [appData, session, profile]);
 
-  if (!authChecked)        return <Loading msg="Loading…" />;
-  if (!session)            return <LoginScreen />;
-  if (!profile)            return <Loading msg="Setting up your account…" />;
-  if (!profile.role)       return (
-    <div style={{ height:"100vh", width:"100vw", background:"#0b0f1c", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:16, fontFamily:"'Inter',sans-serif" }}>
+  const primaryBtn = { marginTop:8, padding:"10px 22px", borderRadius:8, border:"none", background:"#4F8EF7", color:"#fff", fontFamily:"inherit", fontSize:13, fontWeight:700, cursor:"pointer" };
+
+  let screen;
+  if (!authChecked)       screen = <Loading msg="Loading…" />;
+  else if (!session)      screen = <LoginScreen />;
+  else if (!profile)      screen = <Loading msg="Setting up your account…" />;
+  else if (!profile.role) screen = (
+    <Centered>
       <div style={{ fontSize:32 }}>⏳</div>
       <div style={{ fontSize:16, fontWeight:700, color:"#f0f4ff" }}>Waiting for approval</div>
       <div style={{ fontSize:13, color:"#b8cfe0", textAlign:"center", maxWidth:360 }}>Your account ({session.user.email}) needs to be approved by an admin.</div>
       <button onClick={() => supabase.auth.signOut()} style={{ marginTop:8, padding:"10px 22px", borderRadius:8, border:"1px solid #2d3f55", background:"transparent", color:"#b8cfe0", fontFamily:"inherit", fontSize:13, fontWeight:700, cursor:"pointer" }}>Sign out</button>
-    </div>
+    </Centered>
   );
-  if (!appData)            return <Loading msg="Loading data…" />;
+  else if (!appData) screen = (loadError || loadSlow) ? (
+    <Centered>
+      <div style={{ fontSize:32 }}>{loadError ? "⚠️" : "🐢"}</div>
+      <div style={{ fontSize:16, fontWeight:700, color:"#f0f4ff" }}>{loadError ? "Couldn't load your data" : "This is taking longer than usual"}</div>
+      <div style={{ fontSize:13, color:"#b8cfe0", textAlign:"center", maxWidth:360 }}>{loadError ? "There was a problem reaching the server." : "Still trying to reach the server…"}</div>
+      <button onClick={() => { setLoadSlow(false); loadData(); }} style={primaryBtn}>Retry</button>
+    </Centered>
+  ) : <Loading msg="Loading data…" />;
+  else {
+    const authCtxValue = { role: profile.role, memberName: profile.member_name, email: session.user.email };
+    screen = (
+      <AuthCtx.Provider value={authCtxValue}>
+        <PlannerApp initData={appData} onLogout={() => supabase.auth.signOut()} />
+      </AuthCtx.Provider>
+    );
+  }
 
-  const authCtxValue = { role: profile.role, memberName: profile.member_name, email: session.user.email };
-
-  return (
-    <AuthCtx.Provider value={authCtxValue}>
-      <PlannerApp
-        initData={appData}
-        onLogout={() => supabase.auth.signOut()}
-      />
-    </AuthCtx.Provider>
-  );
+  return <>{screen}<ToastHost /></>;
 }
 
 
