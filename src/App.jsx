@@ -38,7 +38,7 @@ const db = {
   async upsertTask(t)     { await supabase.from("tasks").upsert(dbTask(t)); },
   async deleteTask(id)    { await supabase.from("tasks").delete().eq("id", id); },
   // Members
-  async getMembers()      { const {data} = await supabase.from("members").select("*"); return data||[]; },
+  async getMembers()      { const {data} = await supabase.from("members").select("*").order("sort_order"); return data||[]; },
   async upsertMember(m)   { await supabase.from("members").upsert(m); },
   async deleteMember(n)   { await supabase.from("members").delete().eq("name", n); },
   // Customers
@@ -817,7 +817,10 @@ function PlannerApp({ initData, onLogout }) {
   function setMembers(v) {
     setMembersRaw(prev => {
       const next = typeof v === "function" ? v(prev) : v;
-      Object.keys(next).forEach(n => { if (!prev[n] || prev[n].fte !== next[n].fte) db.upsertMember({name:n,fte:next[n].fte}); });
+      Object.keys(next).forEach(n => {
+        if (!prev[n] || prev[n].fte !== next[n].fte || prev[n].sort_order !== next[n].sort_order)
+          db.upsertMember({ name: n, fte: next[n].fte, sort_order: next[n].sort_order ?? 0 });
+      });
       Object.keys(prev).forEach(n => { if (!next[n]) db.deleteMember(n); });
       return next;
     });
@@ -885,7 +888,14 @@ function PlannerApp({ initData, onLogout }) {
   }, [enriched, memberNames, members, memberColors]);
 
   function addMemberIfNew(name) {
-    if (name && !members[name]) setMembers(p => ({ ...p, [name]: { fte: 1.0 } }));
+    if (name && !members[name]) setMembers(p => ({ ...p, [name]: { fte: 1.0, sort_order: Object.keys(p).length } }));
+  }
+  function reorderMembers(newOrder) {
+    setMembers(prev => {
+      const next = {};
+      newOrder.forEach((name, i) => { next[name] = { ...prev[name], sort_order: i }; });
+      return next;
+    });
   }
   function updateMember(name, field, val) { setMembers(p => ({ ...p, [name]: { ...p[name], [field]: val } })); }
   function updateStatus(id, status) {
@@ -1240,6 +1250,7 @@ function PlannerApp({ initData, onLogout }) {
             members={members} memberNames={memberNames} memberColors={memberColors}
             enriched={enriched}
             onUpdateMember={updateMember}
+            onReorderMembers={reorderMembers}
             onRenameMember={(oldName, newName) => {
               if (!newName.trim() || newName === oldName || members[newName]) return;
               setMembers(prev => {
@@ -1255,7 +1266,7 @@ function PlannerApp({ initData, onLogout }) {
             }}
             onAddMember={(name, fte) => {
               if (!name.trim() || members[name]) return false;
-              setMembers(prev => ({ ...prev, [name]: { fte } }));
+              setMembers(prev => ({ ...prev, [name]: { fte, sort_order: Object.keys(prev).length } }));
               return true;
             }}
           />
@@ -1358,13 +1369,38 @@ function CustomerCombobox({ value, customers, onChange, onAddCustomer }) {
 
 // ─── Team management view ─────────────────────────────────────────────────────
 
-function TeamView({ members, memberNames, memberColors, enriched, onUpdateMember, onRenameMember, onRemoveMember, onAddMember }) {
+function TeamView({ members, memberNames, memberColors, enriched, onUpdateMember, onReorderMembers, onRenameMember, onRemoveMember, onAddMember }) {
   const [editingName, setEditingName] = useState(null);   // which member is in rename mode
   const [editNameVal, setEditNameVal] = useState("");
   const [newName, setNewName] = useState("");
   const [newFte, setNewFte] = useState(1.0);
   const [addError, setAddError] = useState("");
   const [confirmRemove, setConfirmRemove] = useState(null);
+  const [dragItem, setDragItem] = useState(null);
+  const [dragOver, setDragOver] = useState(null);
+
+  function handleDragStart(e, name) {
+    setDragItem(name);
+    e.dataTransfer.effectAllowed = "move";
+  }
+  function handleDragOver(e, name) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    if (name !== dragItem) setDragOver(name);
+  }
+  function handleDrop(e, targetName) {
+    e.preventDefault();
+    if (!dragItem || dragItem === targetName) { setDragItem(null); setDragOver(null); return; }
+    const newOrder = [...memberNames];
+    const fromIdx = newOrder.indexOf(dragItem);
+    const toIdx   = newOrder.indexOf(targetName);
+    newOrder.splice(fromIdx, 1);
+    newOrder.splice(toIdx, 0, dragItem);
+    onReorderMembers(newOrder);
+    setDragItem(null);
+    setDragOver(null);
+  }
+  function handleDragEnd() { setDragItem(null); setDragOver(null); }
 
   function startRename(name) { setEditingName(name); setEditNameVal(name); }
   function commitRename(name) {
@@ -1399,9 +1435,26 @@ function TeamView({ members, memberNames, memberColors, enriched, onUpdateMember
           const isConfirming = confirmRemove === m;
 
           return (
-            <div key={m} style={{ background: "#111827", border: `1px solid ${color}33`, borderRadius: 12, padding: "16px 18px" }}>
+            <div
+              key={m}
+              draggable
+              onDragStart={e => handleDragStart(e, m)}
+              onDragOver={e => handleDragOver(e, m)}
+              onDrop={e => handleDrop(e, m)}
+              onDragEnd={handleDragEnd}
+              style={{
+                background: "#111827",
+                border: dragOver === m ? `1px solid #4FD4A0` : `1px solid ${color}33`,
+                borderRadius: 12, padding: "16px 18px",
+                opacity: dragItem === m ? 0.45 : 1,
+                transition: "border 0.15s, opacity 0.15s",
+                cursor: "grab",
+              }}
+            >
               {/* Header row */}
               <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 14 }}>
+                {/* Drag handle */}
+                <div title="Drag to reorder" style={{ color: "#3d5068", fontSize: 16, cursor: "grab", userSelect: "none", flexShrink: 0 }}>⠿</div>
                 <div style={{
                   width: 34, height: 34, borderRadius: "50%",
                   background: color + "22", border: `2px solid ${color}`,
@@ -2151,7 +2204,7 @@ export default function Root() {
         db.getTasks(), db.getMembers(), db.getCustomers(), db.getReports(),
       ]);
       const membersMap = {};
-      memberRows.forEach(r => { membersMap[r.name] = { fte: r.fte }; });
+      memberRows.forEach(r => { membersMap[r.name] = { fte: r.fte, sort_order: r.sort_order ?? 0 }; });
       setAppData({
         tasks:     tasks.length     ? tasks     : INITIAL_TASKS,
         members:   Object.keys(membersMap).length ? membersMap : INITIAL_MEMBERS,
