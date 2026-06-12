@@ -1428,8 +1428,9 @@ function PlannerApp({ initData, onLogout }) {
       // its start date, then count the portion landing in this month.
       const plannedDays = activeTasks.reduce(
         (s, t) => s + plannedDaysInMonth(t.startDate, (t.manDays || 0) * 2, year, month), 0);
-      // Available working days this month = FTE × 20 working days.
-      const availableDays = cfg.fte * HORIZON_DAYS;
+      // Available working days per month is a flat 20 — NOT scaled by FTE. FTE
+      // only affects how long a task takes on the timeline, not monthly capacity.
+      const availableDays = HORIZON_DAYS;
       const utilization = availableDays > 0 ? (plannedDays / availableDays) * 100 : 0;
       return { member: m, tasks: allTasks, activeTasks, totalMD, activeMD, plannedDays, availableDays, utilization, cfg, color: memberColors[m] };
     });
@@ -1733,7 +1734,7 @@ function PlannerApp({ initData, onLogout }) {
                   <StatChip label="available" value={`${Math.round(workload.totalAvailable)}d`} />
                 </StatRow>
                 <StatRow gap={5} mt={5}>
-                  <StatChip label="capacity" value={`${HORIZON_DAYS} d/mo × FTE`} />
+                  <StatChip label="capacity" value={`${HORIZON_DAYS} d/mo`} />
                   <StatChip label="rule" value="1 MD = 2 days" />
                 </StatRow>
               </div>
