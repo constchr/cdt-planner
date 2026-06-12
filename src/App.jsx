@@ -2170,31 +2170,43 @@ export default function Root() {
   const [appData, setAppData] = useState(null);
   const [authChecked, setAuthChecked] = useState(false);
 
-  // Listen for Google OAuth redirect + session changes
+  // Auth: ONLY set session + authChecked here. Never await other supabase
+  // calls inside onAuthStateChange — doing so deadlocks the client's internal
+  // lock and the app hangs forever on "Loading…". Profile loading is deferred
+  // to a separate effect below, keyed on the user id.
   useEffect(() => {
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, sess) => {
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+      setAuthChecked(true);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, sess) => {
       setSession(sess);
-      if (sess?.user) {
-        try {
-          // Upsert profile on every sign-in so name/email stay fresh
-          await db.upsertProfile({
-            id: sess.user.id,
-            email: sess.user.email,
-            full_name: sess.user.user_metadata?.full_name || sess.user.email,
-          });
-          const prof = await db.getProfile(sess.user.id);
-          setProfile(prof);
-        } catch (err) {
-          console.error("Profile load error:", err);
-        }
-      } else {
-        setProfile(null);
-        setAppData(null);
-      }
       setAuthChecked(true);
     });
     return () => subscription.unsubscribe();
   }, []);
+
+  // Load/refresh profile whenever the signed-in user changes.
+  useEffect(() => {
+    const user = session?.user;
+    if (!user) { setProfile(null); setAppData(null); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        // Upsert profile on every sign-in so name/email stay fresh
+        await db.upsertProfile({
+          id: user.id,
+          email: user.email,
+          full_name: user.user_metadata?.full_name || user.email,
+        });
+        const prof = await db.getProfile(user.id);
+        if (!cancelled) setProfile(prof);
+      } catch (err) {
+        console.error("Profile load error:", err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [session?.user?.id]);
 
   // Load app data once profile is known and has a role
   useEffect(() => {
