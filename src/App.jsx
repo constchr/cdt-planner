@@ -185,11 +185,28 @@ function mapJiraPriority(p) {
 function parseJiraXml(raw, hoursPerDay = 8) {
   if (!raw || !raw.trim()) return { tasks: [], error: "Paste the Jira XML first." };
   const cut = raw.indexOf("<");
-  const xml = cut > 0 ? raw.slice(cut) : raw;
-  let doc;
-  try { doc = new DOMParser().parseFromString(xml, "application/xml"); }
-  catch { return { tasks: [], error: "Could not parse the XML." }; }
-  if (doc.querySelector("parsererror")) return { tasks: [], error: "That doesn't look like valid Jira XML." };
+  let xml = cut > 0 ? raw.slice(cut) : raw;
+
+  // Jira's export (especially text copied from the browser's XML viewer) is not
+  // strictly well-formed: URLs carry unescaped ampersands (…?a=1&b=2) and HTML
+  // entities like &nbsp; appear outside CDATA. Escape any '&' that isn't already
+  // a valid XML entity so the parser accepts it.
+  xml = xml.replace(/&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)/g, "&amp;");
+
+  const tryParse = s => {
+    const d = new DOMParser().parseFromString(s, "application/xml");
+    return d.querySelector("parsererror") ? null : d;
+  };
+  let doc = tryParse(xml);
+  if (!doc) {
+    // <description> and <comments> bodies carry arbitrary (sometimes malformed)
+    // HTML we never use — strip them and retry.
+    const stripped = xml
+      .replace(/<description>[\s\S]*?<\/description>/gi, "<description/>")
+      .replace(/<comments>[\s\S]*?<\/comments>/gi, "");
+    doc = tryParse(stripped);
+  }
+  if (!doc) return { tasks: [], error: "That doesn't look like valid Jira XML." };
   const items = [...doc.querySelectorAll("item")];
   if (items.length === 0) return { tasks: [], error: "No <item> tickets found in this XML." };
 
