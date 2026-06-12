@@ -465,6 +465,25 @@ function addWorkingDays(dateStr, n) {
   return d;
 }
 
+// Lay `totalDays` of planned work as consecutive working days (Mon–Fri) starting
+// from startStr, and return how much of it falls within the given calendar month.
+// totalDays may be fractional (the final day can be a part-day).
+function plannedDaysInMonth(startStr, totalDays, year, month) {
+  if (!startStr || totalDays <= 0) return 0;
+  let remaining = totalDays, inMonth = 0, guard = 0;
+  const d = toDate(startStr);
+  while (remaining > 1e-6 && guard < 3000) {
+    if (d.getDay() !== 0 && d.getDay() !== 6) {
+      const chunk = Math.min(1, remaining);
+      if (d.getFullYear() === year && d.getMonth() === month) inMonth += chunk;
+      remaining -= chunk;
+    }
+    d.setDate(d.getDate() + 1);
+    guard++;
+  }
+  return inMonth;
+}
+
 // Count working days between two ISO strings (inclusive start, exclusive end)
 function workingDaysBetween(startStr, endStr) {
   const s = toDate(startStr);
@@ -596,6 +615,12 @@ const inputStyle = {
 const labelStyle = {
   fontSize: 13, color: "#b8cfe0", letterSpacing: "0.12em",
   display: "block", marginBottom: 5,
+};
+
+const monthNavBtn = {
+  width: 34, height: 30, borderRadius: 7, border: "1px solid #2d3f55",
+  background: "#111827", color: "#b8cfe0", fontFamily: "inherit",
+  fontSize: 13, fontWeight: 700, cursor: "pointer", flexShrink: 0,
 };
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
@@ -1247,6 +1272,7 @@ function PlannerApp({ initData, onLogout }) {
   const [taskSearch, setTaskSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("All");
   const [overdueOnly, setOverdueOnly] = useState(false);
+  const [monthOffset, setMonthOffset] = useState(0);  // 0 = current calendar month
   const [ganttStatusFilter, setGanttStatusFilter] = useState("All");
   const [ganttCustomerFilter, setGanttCustomerFilter] = useState("All");
   const isMobile = useMediaQuery("(max-width: 480px)");
@@ -1378,28 +1404,43 @@ function PlannerApp({ initData, onLogout }) {
     return { ...t, pureWdays, workingDays, totalDays, calWork, endDate, dueDate };
   }), [tasks, members]);
 
+  // The calendar month utilization is computed for (current month + offset).
+  const targetMonth = useMemo(() => {
+    const d = new Date();
+    d.setDate(1);
+    d.setMonth(d.getMonth() + monthOffset);
+    return {
+      year: d.getFullYear(), month: d.getMonth(),
+      label: d.toLocaleDateString("en-GB", { month: "long", year: "numeric" }),
+    };
+  }, [monthOffset]);
+
   const workload = useMemo(() => {
+    const { year, month } = targetMonth;
     const memberStats = memberNames.map(m => {
       const allTasks = enriched.filter(t => t.assignee === m);
       const activeTasks = allTasks.filter(t => t.status !== "Done");
       const totalMD = allTasks.reduce((s, t) => s + (t.manDays || 0), 0);
       const activeMD = activeTasks.reduce((s, t) => s + (t.manDays || 0), 0);
       const cfg = members[m] || { fte: 1 };
-      // planned working days this person needs = activeMD * 2 (planning rule)
-      const plannedDays = activeMD * 2;
-      // available working days = FTE * horizon
+      // Planned days that actually fall in the target month: lay each active
+      // task's work (manDays × 2, the "1 MD = 2 days" rule) as working days from
+      // its start date, then count the portion landing in this month.
+      const plannedDays = activeTasks.reduce(
+        (s, t) => s + plannedDaysInMonth(t.startDate, (t.manDays || 0) * 2, year, month), 0);
+      // Available working days this month = FTE × 20 working days.
       const availableDays = cfg.fte * HORIZON_DAYS;
       const utilization = availableDays > 0 ? (plannedDays / availableDays) * 100 : 0;
       return { member: m, tasks: allTasks, activeTasks, totalMD, activeMD, plannedDays, availableDays, utilization, cfg, color: memberColors[m] };
     });
 
-    // Team-level utilization = total planned / total available
+    // Team-level utilization = total planned this month / total available
     const totalPlanned = memberStats.reduce((s, w) => s + w.plannedDays, 0);
     const totalAvailable = memberStats.reduce((s, w) => s + w.availableDays, 0);
     const teamUtilization = totalAvailable > 0 ? (totalPlanned / totalAvailable) * 100 : 0;
 
     return { members: memberStats, teamUtilization, totalPlanned, totalAvailable };
-  }, [enriched, memberNames, members, memberColors]);
+  }, [enriched, memberNames, members, memberColors, targetMonth]);
 
   const overdueCount = useMemo(
     () => enriched.filter(t => isOverdue(t.dueDate) && t.status !== "Done").length,
@@ -1672,17 +1713,27 @@ function PlannerApp({ initData, onLogout }) {
           <div>
             <ViewHeader label="WORKLOAD" accent="#4F8EF7" title="Team Workload & Utilization" />
 
+            {/* Month switcher — utilization is computed per calendar month */}
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 20, flexWrap: "wrap" }}>
+              <button onClick={() => setMonthOffset(o => o - 1)} title="Previous month" style={monthNavBtn}>◀</button>
+              <div style={{ minWidth: 150, textAlign: "center", fontSize: 15, fontWeight: 700, color: "#f0f4ff", letterSpacing: "0.04em" }}>{targetMonth.label}</div>
+              <button onClick={() => setMonthOffset(o => o + 1)} title="Next month" style={monthNavBtn}>▶</button>
+              {monthOffset !== 0 && (
+                <button onClick={() => setMonthOffset(0)} style={{ ...monthNavBtn, width: "auto", padding: "0 12px", fontSize: 12, color: "#6baaf8", borderColor: "#5b9cf6" }}>This month</button>
+              )}
+            </div>
+
             {/* Team utilization dial */}
             <div className="cdt-util-row">
-              <UtilDial value={workload.teamUtilization} size={140} label="TEAM" sublabel={`${workload.members.length} members`} />
+              <UtilDial value={workload.teamUtilization} size={140} label="TEAM" sublabel={targetMonth.label.split(" ")[0]} />
               <div style={{ lineHeight: 2 }}>
-                <div style={{ fontSize: 14, fontWeight: 700, color: utilColor(workload.teamUtilization) }}>{Math.round(workload.teamUtilization)}% team utilization</div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: utilColor(workload.teamUtilization) }}>{Math.round(workload.teamUtilization)}% utilization · {targetMonth.label}</div>
                 <StatRow gap={5} mt={4}>
                   <StatChip label="planned" value={`${Math.round(workload.totalPlanned)}d`} />
                   <StatChip label="available" value={`${Math.round(workload.totalAvailable)}d`} />
                 </StatRow>
                 <StatRow gap={5} mt={5}>
-                  <StatChip label="window" value={`${HORIZON_DAYS} days`} />
+                  <StatChip label="capacity" value={`${HORIZON_DAYS} d/mo × FTE`} />
                   <StatChip label="rule" value="1 MD = 2 days" />
                 </StatRow>
               </div>
