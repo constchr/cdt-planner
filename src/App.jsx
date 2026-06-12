@@ -311,7 +311,14 @@ function toDate(str) {
 }
 
 function toISO(d) {
-  return d.toISOString().slice(0, 10);
+  // Use LOCAL date components, not UTC. toDate() parses "YYYY-MM-DDT00:00:00"
+  // as local midnight, so toISO must read local parts too — otherwise the
+  // round-trip shifts a day in any non-UTC timezone (breaking date nudges,
+  // drag-reschedule, and report dates).
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
 // Returns up to 2 initials: "Constantinos Christofi" → "CC", "Alex" → "A"
