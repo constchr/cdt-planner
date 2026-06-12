@@ -2330,14 +2330,66 @@ function iconBtn(color) {
 
 // ─── Simple task table (workload view) ───────────────────────────────────────
 
+// Default column widths; user-resized widths are persisted to localStorage.
+const TASK_COLS = [
+  ["id", "ID", 150], ["summary", "SUMMARY", 240], ["assignee", "ASSIGNEE", 140],
+  ["customer", "CUSTOMER", 120], ["md", "MD", 60], ["eff", "EFF %", 70],
+  ["buf", "BUF", 60], ["status", "STATUS", 130], ["priority", "PRIORITY", 120],
+  ["due", "DUE", 130],
+];
+const TASK_COL_LS_KEY = "cdt-task-col-widths";
+
 function SimpleTaskTable({ tasks, onStatusChange, onDelete, onEdit, memberColors, readOnly = false }) {
+  const cols = readOnly ? TASK_COLS : [...TASK_COLS, ["actions", "", 72]];
+
+  const [widths, setWidths] = useState(() => {
+    let saved = {};
+    try { saved = JSON.parse(localStorage.getItem(TASK_COL_LS_KEY) || "{}") || {}; } catch { /* ignore */ }
+    const init = {};
+    cols.forEach(([k, , w]) => { init[k] = saved[k] || w; });
+    return init;
+  });
+
+  function applyWidth(key, w) {
+    setWidths(prev => {
+      const next = { ...prev, [key]: Math.max(48, Math.round(w)) };
+      try { localStorage.setItem(TASK_COL_LS_KEY, JSON.stringify(next)); } catch { /* ignore */ }
+      return next;
+    });
+  }
+  function startResize(e, key) {
+    e.preventDefault(); e.stopPropagation();
+    const startX = e.clientX, startW = widths[key];
+    const onMove = ev => applyWidth(key, startW + (ev.clientX - startX));
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = ""; document.body.style.userSelect = "";
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+    document.body.style.cursor = "col-resize"; document.body.style.userSelect = "none";
+  }
+  const totalW = cols.reduce((s, [k]) => s + (widths[k] || 0), 0);
+
   return (
     <div style={{ background: "#111827", borderRadius: 10, border: "1px solid #2d3f55", overflowX: "auto" }}>
-      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14, minWidth: 600 }}>
+      <style>{`
+        .cdt-rt { table-layout: fixed; border-collapse: collapse; font-size: 14px; }
+        .cdt-rt th, .cdt-rt td { overflow: hidden; text-overflow: ellipsis; }
+        .cdt-rt .rz { position: absolute; top: 0; right: -1px; width: 9px; height: 100%; cursor: col-resize; }
+        .cdt-rt .rz::after { content: ""; position: absolute; top: 5px; bottom: 5px; right: 4px; width: 2px; border-radius: 2px; background: transparent; }
+        .cdt-rt .rz:hover::after, .cdt-rt .rz:active::after { background: #4F8EF7; }
+      `}</style>
+      <table className="cdt-rt" style={{ width: totalW, minWidth: totalW }}>
+        <colgroup>{cols.map(([k]) => <col key={k} style={{ width: widths[k] }} />)}</colgroup>
         <thead>
           <tr style={{ background: "#0b0f1c" }}>
-            {["ID","SUMMARY","ASSIGNEE","CUSTOMER","MD","EFF %","BUF","STATUS","PRIORITY","DUE",""].map((h, i) => (
-              <th key={i} style={{ padding: "8px 10px", textAlign: "left", fontSize: 12, color: "#b8cfe0", letterSpacing: "0.08em", fontWeight: 700, borderBottom: "1px solid #2d3f55", whiteSpace: "nowrap" }}>{h}</th>
+            {cols.map(([k, label]) => (
+              <th key={k} style={{ position: "relative", padding: "8px 10px", textAlign: "left", fontSize: 12, color: "#b8cfe0", letterSpacing: "0.08em", fontWeight: 700, borderBottom: "1px solid #2d3f55", whiteSpace: "nowrap" }}>
+                {label}
+                {k !== "actions" && <span className="rz" onMouseDown={e => startResize(e, k)} title="Drag to resize" />}
+              </th>
             ))}
           </tr>
         </thead>
@@ -2351,7 +2403,7 @@ function SimpleTaskTable({ tasks, onStatusChange, onDelete, onEdit, memberColors
                     ? <a href={t.jiraUrl} target="_blank" rel="noopener noreferrer" style={{ color: "#6baaf8", textDecoration: "none", fontSize: 11 }}>{t.id} ↗</a>
                     : <span style={{ color: "#b8cfe0" }}>{t.id}</span>}
                 </td>
-                <td style={{ padding: "8px 10px", color: "#d4e1ed", maxWidth: 180 }}><div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.summary}</div></td>
+                <td style={{ padding: "8px 10px", color: "#d4e1ed", whiteSpace: "nowrap" }}>{t.summary}</td>
                 <td style={{ padding: "8px 10px", color: memberColors[t.assignee] || "#a8bdd0", fontWeight: 700, whiteSpace: "nowrap" }}>{t.assignee}</td>
                 <td style={{ padding: "8px 10px", color: "#b8cfe0", whiteSpace: "nowrap" }}>{t.customer || "—"}</td>
                 <td style={{ padding: "8px 10px", color: "#b8cfe0" }}>{t.manDays}</td>
@@ -2362,7 +2414,7 @@ function SimpleTaskTable({ tasks, onStatusChange, onDelete, onEdit, memberColors
                     ? <StatusBadge status={t.status} />
                     : <select value={t.status} onChange={e => onStatusChange(t.id, e.target.value)} style={{
                         background: STATUS_CONFIG[t.status]?.bg, color: STATUS_CONFIG[t.status]?.color,
-                        border: "none", borderRadius: 4, padding: "2px 6px", fontSize: 12, fontWeight: 700, fontFamily: "inherit", cursor: "pointer",
+                        border: "none", borderRadius: 4, padding: "2px 6px", fontSize: 12, fontWeight: 700, fontFamily: "inherit", cursor: "pointer", maxWidth: "100%",
                       }}>
                         {Object.keys(STATUS_CONFIG).map(s => <option key={s}>{s}</option>)}
                       </select>}
