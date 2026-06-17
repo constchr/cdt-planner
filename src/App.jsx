@@ -20,6 +20,7 @@ function appTask(r) {
     status: r.status, priority: r.priority,
     manDays: r.man_days, efficiencyPct: r.efficiency_pct, bufferDays: r.buffer_days,
     startDate: r.start_date, jiraUrl: r.jira_url || "", deps: r.deps || [],
+    kind: r.kind || "task",   // "task" | "absence"
   };
 }
 // Map app task → DB row
@@ -29,6 +30,7 @@ function dbTask(t) {
     status: t.status, priority: t.priority,
     man_days: t.manDays, efficiency_pct: t.efficiencyPct, buffer_days: t.bufferDays,
     start_date: t.startDate, jira_url: t.jiraUrl || null, deps: t.deps || [],
+    kind: t.kind || "task",
   };
 }
 
@@ -219,27 +221,54 @@ function parseJiraXml(raw, hoursPerDay = 8) {
   if (items.length === 0) return { tasks: [], error: "No <item> tickets found in this XML." };
 
   const txt = (el, sel) => el.querySelector(sel)?.textContent?.trim() || "";
+  // Read a custom field value by its display name.
+  const cf = (item, name) => {
+    let v = "";
+    item.querySelectorAll("customfield").forEach(c => {
+      if (c.querySelector("customfieldname")?.textContent?.trim() === name)
+        v = c.querySelector("customfieldvalue")?.textContent?.trim() || v;
+    });
+    return v;
+  };
   const tasks = items.map(item => {
+    const link = txt(item, "link");
+    const isAbsence = /absence|leave|vacation|holiday/i.test(txt(item, "type"));
+
+    if (isAbsence) {
+      // The absent person is the "Full Name"/"Employee" field, NOT the assignee
+      // (that's the approver). Leave from date → start; Claimed Days → length.
+      const fromRaw = cf(item, "Leave from date");
+      const fromD = fromRaw ? new Date(fromRaw) : null;
+      const startDate = fromD && !isNaN(fromD) ? toISO(fromD) : toISO(new Date());
+      const claimed = parseFloat(cf(item, "Claimed Days")) || 1;
+      const reason = cf(item, "Absence Reason");
+      const person = cf(item, "Full Name") || txt(item, "reporter");
+      return {
+        id: txt(item, "key"),
+        summary: txt(item, "summary") || (reason ? `Absence: ${reason}` : "Absence"),
+        assignee: person,
+        customer: "",
+        status: "To Do", priority: "Low",
+        manDays: claimed, efficiencyPct: 100, bufferDays: 0,
+        startDate, deps: [], jiraUrl: link, kind: "absence",
+      };
+    }
+
     const created = txt(item, "created");
     const cd = created ? new Date(created) : null;
     const startDate = cd && !isNaN(cd) ? toISO(cd) : toISO(new Date());
     const est = item.querySelector("timeoriginalestimate");
     const seconds = est ? parseInt(est.getAttribute("seconds") || "0", 10) : 0;
     const manDays = seconds ? Math.max(0.25, Math.round((seconds / 3600 / hoursPerDay) * 100) / 100) : 1;
-    let customer = "";
-    item.querySelectorAll("customfield").forEach(cf => {
-      if (cf.querySelector("customfieldname")?.textContent?.trim() === "Customer")
-        customer = cf.querySelector("customfieldvalue")?.textContent?.trim() || customer;
-    });
     return {
       id: txt(item, "key"),
       summary: txt(item, "summary") || txt(item, "title"),
       assignee: txt(item, "assignee"),
-      customer,
+      customer: cf(item, "Customer"),
       status: mapJiraStatus(txt(item, "status")),
       priority: mapJiraPriority(txt(item, "priority")),
       manDays, efficiencyPct: 100, bufferDays: 0,
-      startDate, deps: [], jiraUrl: txt(item, "link"),
+      startDate, deps: [], jiraUrl: link, kind: "task",
     };
   }).filter(t => t.id || t.summary);
   return { tasks, error: null };
@@ -498,8 +527,11 @@ function plannedDaysInMonth(startStr, totalDays, year, month) {
 // (man-days × 2 laid as working days from each task's start — the "1 MD = 2 days"
 // rule. Shared by the workload view, the over-capacity alert, and the heatmap.)
 function monthPlannedDays(activeTasks, year, month) {
-  return activeTasks.reduce(
-    (s, t) => s + plannedDaysInMonth(t.startDate, (t.manDays || 0) * 2, year, month), 0);
+  return activeTasks.reduce((s, t) => {
+    // An absence occupies its literal leave working-days; a task uses md × 2.
+    const content = t.kind === "absence" ? (t.manDays || 0) : (t.manDays || 0) * 2;
+    return s + plannedDaysInMonth(t.startDate, content, year, month);
+  }, 0);
 }
 
 // Count working days between two ISO strings (inclusive start, exclusive end)
@@ -1112,10 +1144,12 @@ function GanttChart({ enriched, members, memberColors, memberNames, onMoveTask, 
                         left: barLeft, top: barTop,
                         width: barW, height: BAR_H,
                         borderRadius: 6,
-                        background: task.status === "Done"
+                        background: task.isAbsence
+                          ? "repeating-linear-gradient(45deg,#2a3344,#2a3344 6px,#222a38 6px,#222a38 12px)"
+                          : task.status === "Done"
                           ? "linear-gradient(90deg,#0d3328,#1a4a3a)"
                           : `linear-gradient(90deg,${sc.bg},${color}44)`,
-                        border: `1px solid ${overdue ? "#ef4444" : color}`,
+                        border: `1px solid ${task.isAbsence ? "#6b84a0" : overdue ? "#ef4444" : color}`,
                         cursor: "grab",
                         display: "flex", alignItems: "center",
                         paddingLeft: 7, overflow: "hidden",
@@ -1140,8 +1174,8 @@ function GanttChart({ enriched, members, memberColors, memberNames, onMoveTask, 
                         );
                       })()}
                       <span style={{ fontSize: 13, color: "#f1f5f9", fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: barW - 14, position: "relative", zIndex: 1 }}>
-                        {task.id}
-                        {barW > 80 && <span style={{ color: "#a8bdd0", fontWeight: 400 }}> {task.summary}</span>}
+                        {task.isAbsence ? "🌴" : task.id}
+                        {barW > 80 && <span style={{ color: "#a8bdd0", fontWeight: 400 }}> {task.isAbsence ? "Absence" : task.summary}</span>}
                       </span>
                       {overdue && (
                         <span style={{ position: "absolute", right: 4, top: 2, fontSize: 12, color: "#ef4444", fontWeight: 700 }}>!</span>
@@ -1364,7 +1398,7 @@ function PlannerApp({ initData, onLogout }) {
         status: r.status, priority: r.priority,
         manDays: parseFloat(r.manDays) || 1, efficiencyPct: parseFloat(r.efficiencyPct) || 100,
         bufferDays: parseInt(r.bufferDays) || 0, startDate: r.startDate, deps: r.deps || [],
-        jiraUrl: r.jiraUrl || "",
+        jiraUrl: r.jiraUrl || "", kind: r.kind || "task",
       };
       if (task.assignee) addMemberIfNew(task.assignee);
       if (task.customer) addCustomer(task.customer);
@@ -1410,6 +1444,14 @@ function PlannerApp({ initData, onLogout }) {
 
   // Enrich tasks with computed dates
   const enriched = useMemo(() => tasks.map(t => {
+    // Absences occupy their leave working-days directly — no FTE stretch, no
+    // buffer, no "due next Friday".
+    if (t.kind === "absence") {
+      const wd = Math.max(t.manDays || 0, 0);
+      const endDate = t.startDate ? addWorkingDays(t.startDate, wd) : null;
+      const totalDays = (t.startDate && endDate) ? Math.max(calDaysBetween(t.startDate, toISO(endDate)), 1) : wd;
+      return { ...t, isAbsence: true, pureWdays: wd, workingDays: wd, totalDays, calWork: wd, endDate, dueDate: endDate };
+    }
     const m          = members[t.assignee] || { fte: 1 };
     const pureWdays  = calcWorkingDays(t.manDays, m.fte, t.efficiencyPct);
     const workingDays = pureWdays + (t.bufferDays || 0);  // working days incl. buffer
@@ -1420,7 +1462,7 @@ function PlannerApp({ initData, onLogout }) {
     // calWork = calendar span of pure work portion (for Gantt buffer shading ratio)
     const endNoBuffer = calcTaskEnd(t.startDate, t.manDays, m.fte, t.efficiencyPct, 0);
     const calWork    = (t.startDate && endNoBuffer) ? calDaysBetween(t.startDate, toISO(endNoBuffer)) : pureWdays;
-    return { ...t, pureWdays, workingDays, totalDays, calWork, endDate, dueDate };
+    return { ...t, isAbsence: false, pureWdays, workingDays, totalDays, calWork, endDate, dueDate };
   }), [tasks, members]);
 
   // The calendar month utilization is computed for (current month + offset).
@@ -1439,8 +1481,9 @@ function PlannerApp({ initData, onLogout }) {
     const memberStats = memberNames.map(m => {
       const allTasks = enriched.filter(t => t.assignee === m);
       const activeTasks = allTasks.filter(t => t.status !== "Done");
-      const totalMD = allTasks.reduce((s, t) => s + (t.manDays || 0), 0);
-      const activeMD = activeTasks.reduce((s, t) => s + (t.manDays || 0), 0);
+      // man-day totals are work only — absences consume capacity but aren't effort.
+      const totalMD = allTasks.filter(t => !t.isAbsence).reduce((s, t) => s + (t.manDays || 0), 0);
+      const activeMD = activeTasks.filter(t => !t.isAbsence).reduce((s, t) => s + (t.manDays || 0), 0);
       const cfg = members[m] || { fte: 1 };
       // Planned days that actually fall in the target month (see monthPlannedDays).
       const plannedDays = monthPlannedDays(activeTasks, year, month);
@@ -3595,6 +3638,7 @@ function ImportModal({ memberNames, existingIds, onImport, onClose }) {
                       <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:10 }}>
                         <input type="checkbox" checked={r.include} onChange={e => setRow(i, { include:e.target.checked })} style={{ accentColor:"#5b9cf6", cursor:"pointer" }} />
                         <span style={{ fontSize:13, fontWeight:700, color:"#6baaf8" }}>{r.id || "(no key)"}</span>
+                        {r.kind === "absence" && <span style={{ fontSize:11, color:"#7dd3fc", border:"1px solid #38bdf855", borderRadius:4, padding:"1px 6px" }}>🌴 absence · {r.manDays}d</span>}
                         {dup && <span style={{ fontSize:11, color:"#fbbf24", border:"1px solid #fbbf2455", borderRadius:4, padding:"1px 6px" }}>exists · will overwrite</span>}
                         <span style={{ flex:1 }} />
                         <StatusBadge status={r.status} />
