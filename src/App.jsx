@@ -494,6 +494,14 @@ function plannedDaysInMonth(startStr, totalDays, year, month) {
   return inMonth;
 }
 
+// Sum of planned working-days that a person's active tasks place in a month.
+// (man-days × 2 laid as working days from each task's start — the "1 MD = 2 days"
+// rule. Shared by the workload view, the over-capacity alert, and the heatmap.)
+function monthPlannedDays(activeTasks, year, month) {
+  return activeTasks.reduce(
+    (s, t) => s + plannedDaysInMonth(t.startDate, (t.manDays || 0) * 2, year, month), 0);
+}
+
 // Count working days between two ISO strings (inclusive start, exclusive end)
 function workingDaysBetween(startStr, endStr) {
   const s = toDate(startStr);
@@ -1294,6 +1302,7 @@ function PlannerApp({ initData, onLogout }) {
   const [addTaskModal, setAddTaskModal] = useState({ open: false, assignee: "", startDate: toISO(new Date()) });
   const [editTaskModal, setEditTaskModal] = useState({ open: false, task: null });
   const [importOpen, setImportOpen] = useState(false);
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
 
   // Guard against losing unsaved Status Call notes when navigating or closing.
   const hasUnsavedNotes = useMemo(() => notesHaveContent(statusNotes), [statusNotes]);
@@ -1433,11 +1442,8 @@ function PlannerApp({ initData, onLogout }) {
       const totalMD = allTasks.reduce((s, t) => s + (t.manDays || 0), 0);
       const activeMD = activeTasks.reduce((s, t) => s + (t.manDays || 0), 0);
       const cfg = members[m] || { fte: 1 };
-      // Planned days that actually fall in the target month: lay each active
-      // task's work (manDays × 2, the "1 MD = 2 days" rule) as working days from
-      // its start date, then count the portion landing in this month.
-      const plannedDays = activeTasks.reduce(
-        (s, t) => s + plannedDaysInMonth(t.startDate, (t.manDays || 0) * 2, year, month), 0);
+      // Planned days that actually fall in the target month (see monthPlannedDays).
+      const plannedDays = monthPlannedDays(activeTasks, year, month);
       // Available working days per month is a flat 20 — NOT scaled by FTE. FTE
       // only affects how long a task takes on the timeline, not monthly capacity.
       const availableDays = HORIZON_DAYS;
@@ -1457,6 +1463,17 @@ function PlannerApp({ initData, onLogout }) {
     () => enriched.filter(t => isOverdue(t.dueDate) && t.status !== "Done").length,
     [enriched]);
 
+  // Members over 100% capacity in the *current* calendar month (independent of
+  // the month switcher) — drives the header alert chip.
+  const overCapacity = useMemo(() => {
+    const d = new Date();
+    const y = d.getFullYear(), m = d.getMonth();
+    return memberNames.filter(name => {
+      const active = enriched.filter(t => t.assignee === name && t.status !== "Done");
+      return monthPlannedDays(active, y, m) > HORIZON_DAYS;
+    });
+  }, [enriched, memberNames]);
+
   // Tasks shown on the Schedule (Gantt/list), after the customer/status filters.
   const scheduleEnriched = useMemo(() => enriched.filter(t => {
     if (ganttStatusFilter !== "All" && t.status !== ganttStatusFilter) return false;
@@ -1467,6 +1484,9 @@ function PlannerApp({ initData, onLogout }) {
   function showOverdue() {
     setSelectedMember(null); setStatusFilter("All"); setTaskSearch(""); setOverdueOnly(true);
     setView("workload");
+  }
+  function showOverCapacity() {
+    setMonthOffset(0); setView("workload");
   }
 
   function addMemberIfNew(name) {
@@ -1525,6 +1545,45 @@ function PlannerApp({ initData, onLogout }) {
     });
   }
 
+  // ── Bulk actions on the selected tasks ──────────────────────────────────────
+  function toggleSelect(id) {
+    setSelectedIds(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  }
+  function toggleSelectAll(ids, checked) {
+    setSelectedIds(prev => {
+      const n = new Set(prev);
+      ids.forEach(id => checked ? n.add(id) : n.delete(id));
+      return n;
+    });
+  }
+  function clearSelection() { setSelectedIds(new Set()); }
+
+  function bulkSetField(field, value) {
+    const ids = [...selectedIds];
+    ids.forEach(id => {
+      const task = tasks.find(t => t.id === id);
+      if (!task || task[field] === value) return;
+      const updated = { ...task, [field]: value };
+      db.upsertTask(updated);
+      logHistory(id, field === "status" ? "status" : "reassign", `${task[field]} → ${value}`);
+    });
+    setTasks(p => p.map(t => selectedIds.has(t.id) ? { ...t, [field]: value } : t));
+    toast.success(`Updated ${ids.length} task${ids.length === 1 ? "" : "s"}`);
+    clearSelection();
+  }
+
+  async function bulkDelete() {
+    const ids = [...selectedIds];
+    const removed = tasks.filter(t => ids.includes(t.id));
+    setTasks(p => p.filter(t => !ids.includes(t.id)));   // optimistic
+    clearSelection();
+    for (const id of ids) { await db.deleteTask(id); logHistory(id, "delete", "bulk delete"); }
+    toast.emit({
+      type: "success", message: `Deleted ${ids.length} task${ids.length === 1 ? "" : "s"}`, duration: 7000, actionLabel: "Undo",
+      action: () => { removed.forEach(t => db.upsertTask(t)); setTasks(p => [...p, ...removed.filter(r => !p.some(x => x.id === r.id))]); },
+    });
+  }
+
   // Gantt: move task start date
   function handleMoveTask(taskId, newStartDate, newAssignee) {
     const patch = {};
@@ -1570,6 +1629,7 @@ function PlannerApp({ initData, onLogout }) {
 
   const navItems = [
     { id: "workload", label: "WORKLOAD" },
+    { id: "capacity", label: "CAPACITY" },
     { id: "schedule", label: "SCHEDULE" },
     { id: "standup",  label: "STATUS CALL" },
     { id: "reports",  label: "REPORTS" },
@@ -1688,6 +1748,13 @@ function PlannerApp({ initData, onLogout }) {
                   background: "#ef444422", border: "1px solid #ef4444", borderRadius: 5, padding: "1px 8px",
                   color: "#fca5a5", fontFamily: "inherit", fontSize: 12, fontWeight: 700, letterSpacing: "0.04em",
                 }}>⚠ {overdueCount} overdue</button>
+              )}
+              {overCapacity.length > 0 && (
+                <button onClick={showOverCapacity} title={`Over 100% this month: ${overCapacity.join(", ")}`} style={{
+                  display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer",
+                  background: "#fb923c22", border: "1px solid #fb923c", borderRadius: 5, padding: "1px 8px",
+                  color: "#fdba74", fontFamily: "inherit", fontSize: 12, fontWeight: 700, letterSpacing: "0.04em",
+                }}>⚡ {overCapacity.length} over capacity</button>
               )}
             </div>
           </div>
@@ -1843,19 +1910,60 @@ function PlannerApp({ initData, onLogout }) {
                   ) : visibleTasks.length === 0 ? (
                     <EmptyState icon="🔎" title="No matching tasks" hint="Try a different search or status filter." />
                   ) : (
-                    <SimpleTaskTable
-                      tasks={visibleTasks}
-                      onStatusChange={isAdmin ? updateStatus : () => {}}
-                      onDelete={isAdmin ? deleteTask : () => {}}
-                      onEdit={isAdmin ? (task => setEditTaskModal({ open: true, task })) : null}
-                      memberColors={memberColors}
-                      readOnly={!isAdmin}
-                    />
+                    <>
+                      {isAdmin && selectedIds.size > 0 && (
+                        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 10, padding: "9px 14px", background: "#0d1a2e", border: "1px solid #4F8EF7", borderRadius: 9 }}>
+                          <span style={{ fontSize: 13, fontWeight: 700, color: "#f0f4ff" }}>{selectedIds.size} selected</span>
+                          <span style={{ flex: 1 }} />
+                          <select defaultValue="" onChange={e => { if (e.target.value) { bulkSetField("assignee", e.target.value); e.target.value = ""; } }}
+                            style={{ ...inputStyle, width: 160, padding: "6px 9px", fontSize: 13, cursor: "pointer" }}>
+                            <option value="">Reassign to…</option>
+                            {memberNames.map(m => <option key={m} value={m}>{m}</option>)}
+                          </select>
+                          <select defaultValue="" onChange={e => { if (e.target.value) { bulkSetField("status", e.target.value); e.target.value = ""; } }}
+                            style={{ ...inputStyle, width: 140, padding: "6px 9px", fontSize: 13, cursor: "pointer" }}>
+                            <option value="">Set status…</option>
+                            {Object.keys(STATUS_CONFIG).map(s => <option key={s} value={s}>{s}</option>)}
+                          </select>
+                          <button onClick={bulkDelete} style={{ padding: "6px 14px", borderRadius: 7, border: "1px solid #ef4444", background: "#ef444422", color: "#fca5a5", fontFamily: "inherit", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Delete</button>
+                          <button onClick={clearSelection} style={{ padding: "6px 12px", borderRadius: 7, border: "1px solid #3d5068", background: "transparent", color: "#b8cfe0", fontFamily: "inherit", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Clear</button>
+                        </div>
+                      )}
+                      <SimpleTaskTable
+                        tasks={visibleTasks}
+                        onStatusChange={isAdmin ? updateStatus : () => {}}
+                        onDelete={isAdmin ? deleteTask : () => {}}
+                        onEdit={isAdmin ? (task => setEditTaskModal({ open: true, task })) : null}
+                        memberColors={memberColors}
+                        readOnly={!isAdmin}
+                        selectable={isAdmin}
+                        selectedIds={selectedIds}
+                        onToggleSelect={toggleSelect}
+                        onToggleAll={toggleSelectAll}
+                      />
+                    </>
                   )}
                 </>
               );
             })()}
           </div>
+        )}
+
+        {/* ══ CAPACITY ══ */}
+        {view === "capacity" && (
+          memberNames.length === 0 ? (
+            <div>
+              <ViewHeader label="CAPACITY" accent="#4FD4A0" title="Capacity Heatmap" />
+              <EmptyState icon="📊" title="No team members yet" hint="Add members and schedule tasks to see the capacity heatmap." />
+            </div>
+          ) : (
+            <CapacityView
+              memberNames={memberNames}
+              memberColors={memberColors}
+              enriched={enriched}
+              onPickMonth={(offset) => { setMonthOffset(offset); setView("workload"); }}
+            />
+          )
         )}
 
         {/* ══ SCHEDULE (Gantt) ══ */}
@@ -2349,8 +2457,15 @@ const TASK_COLS = [
 ];
 const TASK_COL_LS_KEY = "cdt-task-col-widths";
 
-function SimpleTaskTable({ tasks, onStatusChange, onDelete, onEdit, memberColors, readOnly = false }) {
-  const cols = readOnly ? TASK_COLS : [...TASK_COLS, ["actions", "", 72]];
+function SimpleTaskTable({ tasks, onStatusChange, onDelete, onEdit, memberColors, readOnly = false,
+                          selectable = false, selectedIds, onToggleSelect, onToggleAll }) {
+  const sel = selectable && !readOnly;
+  const cols = [
+    ...(sel ? [["select", "", 40]] : []),
+    ...TASK_COLS,
+    ...(readOnly ? [] : [["actions", "", 72]]),
+  ];
+  const allSelected = sel && tasks.length > 0 && tasks.every(t => selectedIds.has(t.id));
 
   const [widths, setWidths] = useState(() => {
     let saved = {};
@@ -2396,9 +2511,11 @@ function SimpleTaskTable({ tasks, onStatusChange, onDelete, onEdit, memberColors
         <thead>
           <tr style={{ background: "#0b0f1c" }}>
             {cols.map(([k, label]) => (
-              <th key={k} style={{ position: "relative", padding: "8px 10px", textAlign: "left", fontSize: 12, color: "#b8cfe0", letterSpacing: "0.08em", fontWeight: 700, borderBottom: "1px solid #2d3f55", whiteSpace: "nowrap" }}>
-                {label}
-                {k !== "actions" && <span className="rz" onMouseDown={e => startResize(e, k)} title="Drag to resize" />}
+              <th key={k} style={{ position: "relative", padding: "8px 10px", textAlign: k === "select" ? "center" : "left", fontSize: 12, color: "#b8cfe0", letterSpacing: "0.08em", fontWeight: 700, borderBottom: "1px solid #2d3f55", whiteSpace: "nowrap" }}>
+                {k === "select"
+                  ? <input type="checkbox" checked={allSelected} onChange={e => onToggleAll(tasks.map(t => t.id), e.target.checked)} title="Select all" style={{ accentColor: "#4F8EF7", cursor: "pointer" }} />
+                  : label}
+                {k !== "actions" && k !== "select" && <span className="rz" onMouseDown={e => startResize(e, k)} title="Drag to resize" />}
               </th>
             ))}
           </tr>
@@ -2406,8 +2523,14 @@ function SimpleTaskTable({ tasks, onStatusChange, onDelete, onEdit, memberColors
         <tbody>
           {tasks.map((t, i) => {
             const overdue = isOverdue(t.dueDate) && t.status !== "Done";
+            const isSel = sel && selectedIds.has(t.id);
             return (
-              <tr key={t.id} style={{ borderBottom: i < tasks.length - 1 ? "1px solid #0d1220" : "none" }}>
+              <tr key={t.id} style={{ borderBottom: i < tasks.length - 1 ? "1px solid #0d1220" : "none", background: isSel ? "#1e3a5f55" : "transparent" }}>
+                {sel && (
+                  <td style={{ padding: "8px 10px", textAlign: "center" }}>
+                    <input type="checkbox" checked={isSel} onChange={() => onToggleSelect(t.id)} style={{ accentColor: "#4F8EF7", cursor: "pointer" }} />
+                  </td>
+                )}
                 <td style={{ padding: "8px 10px", whiteSpace: "nowrap" }}>
                   {t.jiraUrl
                     ? <a href={t.jiraUrl} target="_blank" rel="noopener noreferrer" style={{ color: "#6baaf8", textDecoration: "none", fontSize: 11 }}>{t.id} ↗</a>
@@ -2446,6 +2569,84 @@ function SimpleTaskTable({ tasks, onStatusChange, onDelete, onEdit, memberColors
           })}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+// ─── Capacity heatmap ─────────────────────────────────────────────────────────
+
+function CapacityView({ memberNames, memberColors, enriched, onPickMonth }) {
+  const MONTHS = 6;
+  const months = useMemo(() => {
+    const base = new Date(); base.setDate(1);
+    return Array.from({ length: MONTHS }, (_, i) => {
+      const d = new Date(base.getFullYear(), base.getMonth() + i, 1);
+      return { offset: i, year: d.getFullYear(), month: d.getMonth(),
+        short: d.toLocaleDateString("en-GB", { month: "short" }),
+        full: d.toLocaleDateString("en-GB", { month: "long", year: "numeric" }) };
+    });
+  }, []);
+
+  // Precompute util per member per month.
+  const grid = useMemo(() => memberNames.map(name => {
+    const active = enriched.filter(t => t.assignee === name && t.status !== "Done");
+    const cells = months.map(mo => {
+      const planned = monthPlannedDays(active, mo.year, mo.month);
+      return { ...mo, planned, util: HORIZON_DAYS > 0 ? (planned / HORIZON_DAYS) * 100 : 0 };
+    });
+    return { name, color: memberColors[name], cells };
+  }), [memberNames, enriched, months, memberColors]);
+
+  const cellBase = { padding: "10px 8px", textAlign: "center", borderBottom: "1px solid #0d1220", fontVariantNumeric: "tabular-nums" };
+
+  return (
+    <div>
+      <ViewHeader label="CAPACITY" accent="#4FD4A0" title="Capacity Heatmap" />
+      <div style={{ fontSize: 14, color: "#b8cfe0", marginBottom: 16, lineHeight: 1.6 }}>
+        Monthly utilization per person over the next {MONTHS} months — planned working days ÷ 20. Click a cell to open that month in Workload.
+      </div>
+      <div style={{ overflowX: "auto", border: "1px solid #2d3f55", borderRadius: 10, background: "#111827" }}>
+        <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 520, fontSize: 14 }}>
+          <thead>
+            <tr style={{ background: "#0b0f1c" }}>
+              <th style={{ textAlign: "left", padding: "10px 14px", fontSize: 12, color: "#b8cfe0", letterSpacing: "0.08em", fontWeight: 700, borderBottom: "1px solid #2d3f55", position: "sticky", left: 0, background: "#0b0f1c", minWidth: 150 }}>MEMBER</th>
+              {months.map(mo => (
+                <th key={mo.offset} title={mo.full} style={{ padding: "10px 8px", fontSize: 12, color: mo.offset === 0 ? "#6baaf8" : "#b8cfe0", letterSpacing: "0.06em", fontWeight: 700, borderBottom: "1px solid #2d3f55", textTransform: "uppercase", minWidth: 64 }}>
+                  {mo.short}{mo.offset === 0 ? " •" : ""}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {grid.map(row => (
+              <tr key={row.name}>
+                <td style={{ padding: "8px 14px", whiteSpace: "nowrap", borderBottom: "1px solid #0d1220", position: "sticky", left: 0, background: "#111827", display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ width: 22, height: 22, borderRadius: "50%", background: row.color + "22", border: `2px solid ${row.color}`, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: row.color, flexShrink: 0 }}>{initials(row.name)}</span>
+                  <span style={{ fontSize: 14, fontWeight: 700, color: "#f1f5f9" }}>{row.name}</span>
+                </td>
+                {row.cells.map(c => {
+                  const col = utilColor(c.util);
+                  const has = c.planned > 0;
+                  return (
+                    <td key={c.offset} onClick={() => onPickMonth(c.offset)} title={`${row.name} · ${c.full}\n${c.planned.toFixed(1)} planned / ${HORIZON_DAYS} days`}
+                      style={{ ...cellBase, cursor: "pointer", background: has ? col + "1f" : "transparent" }}>
+                      <span style={{ fontSize: 14, fontWeight: 700, color: has ? col : "#3d5068" }}>{Math.round(c.util)}%</span>
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {/* Legend */}
+      <div style={{ display: "flex", gap: 16, marginTop: 14, flexWrap: "wrap", fontSize: 13, color: "#b8cfe0" }}>
+        {[["#5b9cf6", "< 50%"], ["#fbbf24", "50–85%"], ["#3dd68c", "85–110%"], ["#f87171", "> 110% over capacity"]].map(([c, l]) => (
+          <div key={l} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ width: 14, height: 14, borderRadius: 3, background: c + "1f", border: `1px solid ${c}` }} />{l}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
