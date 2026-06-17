@@ -21,6 +21,7 @@ function appTask(r) {
     manDays: r.man_days, efficiencyPct: r.efficiency_pct, bufferDays: r.buffer_days,
     startDate: r.start_date, jiraUrl: r.jira_url || "", deps: r.deps || [],
     kind: r.kind || "task",   // "task" | "absence"
+    doneAt: r.done_at || null, // ISO timestamp when marked Done
   };
 }
 // Map app task → DB row
@@ -31,7 +32,19 @@ function dbTask(t) {
     man_days: t.manDays, efficiency_pct: t.efficiencyPct, buffer_days: t.bufferDays,
     start_date: t.startDate, jira_url: t.jiraUrl || null, deps: t.deps || [],
     kind: t.kind || "task",
+    done_at: t.doneAt || null,
   };
+}
+
+// When a status change to "Done" happens, stamp the time; clear it otherwise.
+function doneAtFor(status, prevTask) {
+  if (status === "Done") return prevTask?.doneAt || new Date().toISOString();
+  return null;
+}
+// True if a task was marked Done within the last `days` days.
+function doneWithinDays(t, days) {
+  if (t.status !== "Done" || !t.doneAt) return false;
+  return (Date.now() - new Date(t.doneAt).getTime()) <= days * 86400000;
 }
 
 // ─── Toast / notification bus ─────────────────────────────────────────────────
@@ -1399,6 +1412,7 @@ function PlannerApp({ initData, onLogout }) {
         manDays: parseFloat(r.manDays) || 1, efficiencyPct: parseFloat(r.efficiencyPct) || 100,
         bufferDays: parseInt(r.bufferDays) || 0, startDate: r.startDate, deps: r.deps || [],
         jiraUrl: r.jiraUrl || "", kind: r.kind || "task",
+        doneAt: r.status === "Done" ? new Date().toISOString() : null,
       };
       if (task.assignee) addMemberIfNew(task.assignee);
       if (task.customer) addCustomer(task.customer);
@@ -1486,7 +1500,8 @@ function PlannerApp({ initData, onLogout }) {
       const activeMD = activeTasks.filter(t => !t.isAbsence).reduce((s, t) => s + (t.manDays || 0), 0);
       const cfg = members[m] || { fte: 1 };
       // Planned days that actually fall in the target month (see monthPlannedDays).
-      const plannedDays = monthPlannedDays(activeTasks, year, month);
+      // Includes Done tasks — completed work still consumed capacity in its month.
+      const plannedDays = monthPlannedDays(allTasks, year, month);
       // Available working days per month is a flat 20 — NOT scaled by FTE. FTE
       // only affects how long a task takes on the timeline, not monthly capacity.
       const availableDays = HORIZON_DAYS;
@@ -1512,13 +1527,15 @@ function PlannerApp({ initData, onLogout }) {
     const d = new Date();
     const y = d.getFullYear(), m = d.getMonth();
     return memberNames.filter(name => {
-      const active = enriched.filter(t => t.assignee === name && t.status !== "Done");
-      return monthPlannedDays(active, y, m) > HORIZON_DAYS;
+      const mine = enriched.filter(t => t.assignee === name);
+      return monthPlannedDays(mine, y, m) > HORIZON_DAYS;
     });
   }, [enriched, memberNames]);
 
-  // Tasks shown on the Schedule (Gantt/list), after the customer/status filters.
+  // Tasks shown on the Schedule (Gantt/list). Done tasks are hidden from the
+  // schedule; absences stay. Then the customer/status filters apply.
   const scheduleEnriched = useMemo(() => enriched.filter(t => {
+    if (t.status === "Done") return false;
     if (ganttStatusFilter !== "All" && t.status !== ganttStatusFilter) return false;
     if (ganttCustomerFilter !== "All" && (t.customer || "") !== ganttCustomerFilter) return false;
     return true;
@@ -1569,7 +1586,7 @@ function PlannerApp({ initData, onLogout }) {
   }
   function updateStatus(id, status) {
     const prev = tasks.find(t => t.id === id);
-    persistTaskUpdate(id, { status }).then(ok => {
+    persistTaskUpdate(id, { status, doneAt: doneAtFor(status, prev) }).then(ok => {
       if (ok && prev && prev.status !== status) logHistory(id, "status", `${prev.status} → ${status}`);
     });
   }
@@ -1603,14 +1620,14 @@ function PlannerApp({ initData, onLogout }) {
 
   function bulkSetField(field, value) {
     const ids = [...selectedIds];
+    const patchFor = task => field === "status" ? { status: value, doneAt: doneAtFor(value, task) } : { [field]: value };
     ids.forEach(id => {
       const task = tasks.find(t => t.id === id);
       if (!task || task[field] === value) return;
-      const updated = { ...task, [field]: value };
-      db.upsertTask(updated);
+      db.upsertTask({ ...task, ...patchFor(task) });
       logHistory(id, field === "status" ? "status" : "reassign", `${task[field]} → ${value}`);
     });
-    setTasks(p => p.map(t => selectedIds.has(t.id) ? { ...t, [field]: value } : t));
+    setTasks(p => p.map(t => selectedIds.has(t.id) ? { ...t, ...patchFor(t) } : t));
     toast.success(`Updated ${ids.length} task${ids.length === 1 ? "" : "s"}`);
     clearSelection();
   }
@@ -1832,7 +1849,16 @@ function PlannerApp({ initData, onLogout }) {
         )}
         {view === "workload" && memberNames.length > 0 && (
           <div>
-            <ViewHeader label="WORKLOAD" accent="#4F8EF7" title="Team Workload & Utilization" />
+            <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+              <ViewHeader label="WORKLOAD" accent="#4F8EF7" title="Team Workload & Utilization" />
+              {isAdmin && (
+                <button onClick={() => setImportOpen(true)} style={{
+                  padding: "8px 16px", borderRadius: 8, border: "1px solid #5b9cf6",
+                  background: "#5b9cf615", color: "#6baaf8", fontFamily: "inherit",
+                  fontSize: 13, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap",
+                }}>⬇ Import from Jira</button>
+              )}
+            </div>
 
             {/* Month switcher — utilization is computed per calendar month */}
             <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 20, flexWrap: "wrap" }}>
@@ -1907,9 +1933,13 @@ function PlannerApp({ initData, onLogout }) {
               ))}
             </div>
             {(() => {
-              const baseTasks = selectedMember
+              // The ALL TASKS list excludes Done tasks (gone once complete) and
+              // absences (calendar items shown only on the Gantt) — they all
+              // still count in the utilization/capacity figures above.
+              const scope = selectedMember
                 ? enriched.filter(t => t.assignee === selectedMember)
                 : isAdmin ? enriched : enriched.filter(t => t.assignee === myName);
+              const baseTasks = scope.filter(t => !t.isAbsence && t.status !== "Done");
               const q = taskSearch.trim().toLowerCase();
               const visibleTasks = baseTasks.filter(t => {
                 if (overdueOnly && !(isOverdue(t.dueDate) && t.status !== "Done")) return false;
@@ -1940,7 +1970,7 @@ function PlannerApp({ initData, onLogout }) {
                     <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}
                       style={{ ...inputStyle, width: 130, padding: "7px 10px", fontSize: 13, cursor: "pointer" }}>
                       <option value="All">All statuses</option>
-                      {Object.keys(STATUS_CONFIG).map(s => <option key={s} value={s}>{s}</option>)}
+                      {Object.keys(STATUS_CONFIG).filter(s => s !== "Done").map(s => <option key={s} value={s}>{s}</option>)}
                     </select>
                   </div>
                   {baseTasks.length === 0 ? (
@@ -2046,7 +2076,7 @@ function PlannerApp({ initData, onLogout }) {
                     title="Filter by status"
                     style={{ ...inputStyle, width: 130, padding: "7px 10px", fontSize: 13, cursor: "pointer" }}>
                     <option value="All">All statuses</option>
-                    {Object.keys(STATUS_CONFIG).map(s => <option key={s} value={s}>{s}</option>)}
+                    {Object.keys(STATUS_CONFIG).filter(s => s !== "Done").map(s => <option key={s} value={s}>{s}</option>)}
                   </select>
                 </div>
                 {isMobile ? (
@@ -2172,12 +2202,13 @@ function PlannerApp({ initData, onLogout }) {
           customers={customers}
           onAddCustomer={addCustomer}
           onSave={async (updated) => {
+            const prev = tasks.find(t => t.id === updated.id);
             const saved = { ...updated,
               manDays: parseFloat(updated.manDays) || 1,
               efficiencyPct: parseFloat(updated.efficiencyPct) || 100,
               bufferDays: parseInt(updated.bufferDays) || 0,
+              doneAt: doneAtFor(updated.status, prev),
             };
-            const prev = tasks.find(t => t.id === saved.id);
             setTasks(p => p.map(t => t.id === saved.id ? { ...t, ...saved } : t)); // optimistic
             setEditTaskModal({ open: false, task: null });
             const ok = await db.upsertTask(saved);
@@ -2630,9 +2661,10 @@ function CapacityView({ memberNames, memberColors, enriched, onPickMonth }) {
     });
   }, []);
 
-  // Precompute util per member per month.
+  // Precompute util per member per month. Includes Done tasks — completed work
+  // still consumed capacity in the month it was scheduled.
   const grid = useMemo(() => memberNames.map(name => {
-    const active = enriched.filter(t => t.assignee === name && t.status !== "Done");
+    const active = enriched.filter(t => t.assignee === name);
     const cells = months.map(mo => {
       const planned = monthPlannedDays(active, mo.year, mo.month);
       return { ...mo, planned, util: HORIZON_DAYS > 0 ? (planned / HORIZON_DAYS) * 100 : 0 };
@@ -2779,7 +2811,10 @@ function StatusCallView({ memberNames, memberColors, members, enriched, statusNo
         {memberNames.map(member => {
           const color = memberColors[member];
           const notes = getMemberNotes(member);
-          const activeTasks = enriched.filter(t => t.assignee === member && t.status !== "Done");
+          // Work tasks that are still active, plus ones finished in the last week.
+          // Absences aren't work to report on, so they're excluded here.
+          const activeTasks = enriched.filter(t => t.assignee === member && !t.isAbsence &&
+            (t.status !== "Done" || doneWithinDays(t, 7)));
           const fte = members[member]?.fte || 1;
 
           return (
