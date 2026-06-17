@@ -122,6 +122,14 @@ const db = {
     if (error) { console.error("upsertProfile:", error.message); return false; }
     return true;
   },
+  // Editing an EXISTING account (admin sets role/member). Uses update — not
+  // upsert — so only the admin-friendly UPDATE policy applies; an upsert would
+  // also hit the INSERT policy (own-row-only) and be blocked for other users.
+  async updateProfile(id, patch) {
+    const { error } = await supabase.from("profiles").update(patch).eq("id", id);
+    if (error) { toast.error("Couldn't update account: " + error.message); return false; }
+    return true;
+  },
   async getProfiles() {
     const { data, error } = await supabase.from("profiles").select("*");
     if (error) { toast.error("Couldn't load accounts: " + error.message); return []; }
@@ -354,8 +362,10 @@ function AccountsView({ memberNames }) {
   useEffect(() => { db.getProfiles().then(p => { setProfiles(p); setLoading(false); }); }, []);
 
   async function updateProfile(id, patch) {
-    await db.upsertProfile({ id, ...patch });
-    setProfiles(prev => prev.map(p => p.id === id ? { ...p, ...patch } : p));
+    const prev = profiles;
+    setProfiles(prevList => prevList.map(p => p.id === id ? { ...p, ...patch } : p)); // optimistic
+    const ok = await db.updateProfile(id, patch);
+    if (!ok) { setProfiles(prev); return; }  // rollback; db showed an error toast
     setSuccess("Saved"); setTimeout(() => setSuccess(""), 2500);
   }
 
