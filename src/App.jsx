@@ -1656,7 +1656,7 @@ function PlannerApp({ initData, onLogout }) {
     { id: "capacity", label: "CAPACITY" },
     { id: "schedule", label: "SCHEDULE" },
     { id: "standup",  label: "STATUS CALL" },
-    { id: "done",     label: "DONE" },
+    { id: "done",     label: "COMPLETED TASKS" },
     { id: "reports",  label: "REPORTS" },
     ...(isAdmin ? [
       { id: "team",     label: "TEAM" },
