@@ -615,29 +615,6 @@ function daysAgo(n) {
   return toISO(d);
 }
 
-// ─── Initial data ─────────────────────────────────────────────────────────────
-
-const INITIAL_TASKS = [
-  { id: "T-101", summary: "Design system architecture",  assignee: "Alex",   status: "In Progress", priority: "Critical", manDays: 8,  efficiencyPct: 100, bufferDays: 0, startDate: daysAgo(5),  deps: [], jiraUrl: "" },
-  { id: "T-102", summary: "API endpoint specification",  assignee: "Maria",  status: "Done",        priority: "High",     manDays: 5,  efficiencyPct: 120, bufferDays: 0, startDate: daysAgo(14), deps: ["T-101"], jiraUrl: "" },
-  { id: "T-103", summary: "Database schema migration",   assignee: "Alex",   status: "To Do",       priority: "High",     manDays: 6,  efficiencyPct: 100, bufferDays: 2, startDate: daysAgo(0),  deps: ["T-102"], jiraUrl: "" },
-  { id: "T-104", summary: "Unit test coverage pass",     assignee: "Jordan", status: "To Do",       priority: "Medium",   manDays: 4,  efficiencyPct: 80,  bufferDays: 0, startDate: daysAgo(0),  deps: ["T-102"], jiraUrl: "" },
-  { id: "T-105", summary: "CI/CD pipeline setup",        assignee: "Sam",    status: "In Progress", priority: "High",     manDays: 7,  efficiencyPct: 150, bufferDays: 1, startDate: daysAgo(3),  deps: [], jiraUrl: "" },
-  { id: "T-106", summary: "Frontend auth integration",   assignee: "Maria",  status: "Blocked",     priority: "Critical", manDays: 6,  efficiencyPct: 100, bufferDays: 3, startDate: daysAgo(0),  deps: ["T-102","T-105"], jiraUrl: "" },
-  { id: "T-107", summary: "Performance benchmarking",    assignee: "Jordan", status: "To Do",       priority: "Low",      manDays: 3,  efficiencyPct: 90,  bufferDays: 0, startDate: daysAgo(0),  deps: ["T-103"], jiraUrl: "" },
-  { id: "T-108", summary: "Security audit prep",         assignee: "Sam",    status: "To Do",       priority: "Medium",   manDays: 5,  efficiencyPct: 100, bufferDays: 0, startDate: daysAgo(0),  deps: ["T-103"], jiraUrl: "" },
-  { id: "T-109", summary: "Documentation update",        assignee: "Casey",  status: "In Progress", priority: "Low",      manDays: 3,  efficiencyPct: 200, bufferDays: 5, startDate: daysAgo(2),  deps: [], jiraUrl: "" },
-  { id: "T-110", summary: "Load testing",                assignee: "Casey",  status: "To Do",       priority: "Medium",   manDays: 5,  efficiencyPct: 100, bufferDays: 0, startDate: daysAgo(0),  deps: ["T-105"], jiraUrl: "" },
-];
-
-const INITIAL_MEMBERS = {
-  Alex:   { fte: 1.0  },
-  Maria:  { fte: 0.5  },
-  Jordan: { fte: 1.0  },
-  Sam:    { fte: 0.75 },
-  Casey:  { fte: 1.0  },
-};
-
 // ─── CSV parser ───────────────────────────────────────────────────────────────
 
 function parseCSV(text) {
@@ -1561,19 +1538,6 @@ function PlannerApp({ initData, onLogout }) {
   }
   function updateMember(name, field, val) { setMembers(p => ({ ...p, [name]: { ...p[name], [field]: val } })); }
 
-  // Seed the demo dataset (admin only) — used from the empty state.
-  function loadSampleData() {
-    const seededMembers = {};
-    Object.entries(INITIAL_MEMBERS).forEach(([name, cfg], i) => {
-      seededMembers[name] = { fte: cfg.fte, sort_order: i };
-      db.upsertMember({ name, fte: cfg.fte, sort_order: i });
-    });
-    INITIAL_TASKS.forEach(t => db.upsertTask(t));
-    setMembersRaw(seededMembers);
-    setTasksRaw(INITIAL_TASKS);
-    toast.success("Sample data loaded");
-  }
-
   // Optimistically apply a task patch, persist it, and roll back on failure.
   async function persistTaskUpdate(id, patch) {
     const task = tasks.find(t => t.id === id);
@@ -1692,6 +1656,7 @@ function PlannerApp({ initData, onLogout }) {
     { id: "capacity", label: "CAPACITY" },
     { id: "schedule", label: "SCHEDULE" },
     { id: "standup",  label: "STATUS CALL" },
+    { id: "done",     label: "DONE" },
     { id: "reports",  label: "REPORTS" },
     ...(isAdmin ? [
       { id: "team",     label: "TEAM" },
@@ -1841,9 +1806,8 @@ function PlannerApp({ initData, onLogout }) {
               icon="👋"
               title="Welcome to CDT Planner"
               hint={isAdmin
-                ? "Get started by adding team members in the Team tab, then schedule their tasks. Or load a sample dataset to explore the features first."
+                ? "Get started by adding team members in the Team tab, then schedule their tasks."
                 : "Your team hasn't been set up yet. Once an admin adds members and tasks, your workload will appear here."}
-              action={isAdmin ? { label: "Load sample data", onClick: loadSampleData } : null}
             />
           </div>
         )}
@@ -1977,8 +1941,7 @@ function PlannerApp({ initData, onLogout }) {
                     <EmptyState
                       icon="📋"
                       title="No tasks yet"
-                      hint={isAdmin ? "Add your first task from the Schedule tab, or load sample data to explore." : "Tasks assigned to you will show up here."}
-                      action={isAdmin && memberNames.length > 0 ? { label: "Load sample data", onClick: loadSampleData } : null}
+                      hint={isAdmin ? "Add your first task from the Schedule tab." : "Tasks assigned to you will show up here."}
                     />
                   ) : visibleTasks.length === 0 ? (
                     <EmptyState icon="🔎" title="No matching tasks" hint="Try a different search or status filter." />
@@ -2037,6 +2000,19 @@ function PlannerApp({ initData, onLogout }) {
               onPickMonth={(offset) => { setMonthOffset(offset); setView("workload"); }}
             />
           )
+        )}
+
+        {/* ══ DONE ══ */}
+        {view === "done" && (
+          <DoneView
+            enriched={isAdmin ? enriched : enriched.filter(t => t.assignee === myName)}
+            memberNames={memberNames}
+            memberColors={memberColors}
+            isAdmin={isAdmin}
+            onReopen={id => updateStatus(id, "To Do")}
+            onDelete={deleteTask}
+            onEdit={isAdmin ? (task => setEditTaskModal({ open: true, task })) : null}
+          />
         )}
 
         {/* ══ SCHEDULE (Gantt) ══ */}
@@ -2643,6 +2619,111 @@ function SimpleTaskTable({ tasks, onStatusChange, onDelete, onEdit, memberColors
           })}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+// ─── Done tasks list ──────────────────────────────────────────────────────────
+
+function DoneView({ enriched, memberNames, memberColors, isAdmin, onReopen, onDelete, onEdit }) {
+  const [assignee, setAssignee] = useState("All");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [q, setQ] = useState("");
+  const [confirmId, setConfirmId] = useState(null);
+
+  const done = useMemo(
+    () => enriched.filter(t => t.status === "Done" && !t.isAbsence),
+    [enriched]);
+
+  const filtered = useMemo(() => {
+    const query = q.trim().toLowerCase();
+    return done.filter(t => {
+      if (assignee !== "All" && t.assignee !== assignee) return false;
+      const dISO = t.doneAt ? t.doneAt.slice(0, 10) : "";
+      if (from && (!dISO || dISO < from)) return false;
+      if (to && (!dISO || dISO > to)) return false;
+      if (query && ![t.id, t.summary, t.assignee, t.customer].some(v => (v || "").toLowerCase().includes(query))) return false;
+      return true;
+    }).sort((a, b) => (b.doneAt || "").localeCompare(a.doneAt || ""));
+  }, [done, assignee, from, to, q]);
+
+  const th = { padding: "8px 12px", textAlign: "left", fontSize: 12, color: "#b8cfe0", letterSpacing: "0.08em", fontWeight: 700, borderBottom: "1px solid #2d3f55", whiteSpace: "nowrap" };
+  const td = { padding: "8px 12px", whiteSpace: "nowrap" };
+  const fmtDone = iso => iso ? new Date(iso).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }) : "—";
+
+  return (
+    <div>
+      <ViewHeader label="ARCHIVE" accent="#4FD4A0" title="Completed Tasks" />
+
+      {/* Filters */}
+      <div style={{ display: "flex", alignItems: "flex-end", gap: 10, flexWrap: "wrap", marginBottom: 16 }}>
+        <div>
+          <label style={{ ...labelStyle, fontSize: 11 }}>ASSIGNEE</label>
+          <select value={assignee} onChange={e => setAssignee(e.target.value)} style={{ ...inputStyle, width: 170, padding: "7px 10px", fontSize: 13, cursor: "pointer" }}>
+            <option value="All">All assignees</option>
+            {memberNames.map(m => <option key={m} value={m}>{m}</option>)}
+          </select>
+        </div>
+        <div>
+          <label style={{ ...labelStyle, fontSize: 11 }}>COMPLETED FROM</label>
+          <input type="date" value={from} onChange={e => setFrom(e.target.value)} style={{ ...inputStyle, width: 150, padding: "7px 10px", fontSize: 13, colorScheme: "dark" }} />
+        </div>
+        <div>
+          <label style={{ ...labelStyle, fontSize: 11 }}>TO</label>
+          <input type="date" value={to} onChange={e => setTo(e.target.value)} style={{ ...inputStyle, width: 150, padding: "7px 10px", fontSize: 13, colorScheme: "dark" }} />
+        </div>
+        <div style={{ flex: 1, minWidth: 160 }}>
+          <label style={{ ...labelStyle, fontSize: 11 }}>SEARCH</label>
+          <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search…" style={{ ...inputStyle, padding: "7px 10px", fontSize: 13 }} />
+        </div>
+        {(assignee !== "All" || from || to || q) && (
+          <button onClick={() => { setAssignee("All"); setFrom(""); setTo(""); setQ(""); }} style={{ padding: "8px 14px", borderRadius: 7, border: "1px solid #3d5068", background: "transparent", color: "#b8cfe0", fontFamily: "inherit", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Clear</button>
+        )}
+      </div>
+
+      <div style={{ fontSize: 13, color: "#b8cfe0", marginBottom: 10 }}>{filtered.length} completed task{filtered.length === 1 ? "" : "s"}</div>
+
+      {filtered.length === 0 ? (
+        <EmptyState icon="✅" title="No completed tasks" hint={done.length === 0 ? "Tasks marked Done will be archived here." : "No completed tasks match the filters."} />
+      ) : (
+        <div style={{ background: "#111827", borderRadius: 10, border: "1px solid #2d3f55", overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14, minWidth: 720 }}>
+            <thead>
+              <tr style={{ background: "#0b0f1c" }}>
+                {["ID", "SUMMARY", "ASSIGNEE", "CUSTOMER", "MD", "COMPLETED", "DUE", ""].map((h, i) => <th key={i} style={th}>{h}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((t, i) => (
+                <tr key={t.id} style={{ borderBottom: i < filtered.length - 1 ? "1px solid #0d1220" : "none" }}>
+                  <td style={td}>{t.jiraUrl ? <a href={t.jiraUrl} target="_blank" rel="noopener noreferrer" style={{ color: "#6baaf8", textDecoration: "none", fontSize: 11 }}>{t.id} ↗</a> : <span style={{ color: "#b8cfe0" }}>{t.id}</span>}</td>
+                  <td style={{ ...td, color: "#d4e1ed", whiteSpace: "normal", maxWidth: 280 }}>{t.summary}</td>
+                  <td style={{ ...td, color: memberColors[t.assignee] || "#a8bdd0", fontWeight: 700 }}>{t.assignee}</td>
+                  <td style={{ ...td, color: "#b8cfe0" }}>{t.customer || "—"}</td>
+                  <td style={{ ...td, color: "#b8cfe0" }}>{t.manDays}</td>
+                  <td style={{ ...td, color: "#4FD4A0", fontWeight: 700 }}>{fmtDone(t.doneAt)}</td>
+                  <td style={{ ...td, color: "#94b4cc" }}>{fmtDate(t.dueDate)}</td>
+                  <td style={td}>
+                    {isAdmin && (confirmId === t.id ? (
+                      <span style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
+                        <button onClick={() => { onDelete(t.id); setConfirmId(null); }} style={{ background: "none", border: "1px solid #ef4444", borderRadius: 5, color: "#fca5a5", cursor: "pointer", fontSize: 11, fontWeight: 700, fontFamily: "inherit", padding: "2px 7px" }}>Delete</button>
+                        <button onClick={() => setConfirmId(null)} style={{ background: "none", border: "none", color: "#94b4cc", cursor: "pointer", fontSize: 12, fontFamily: "inherit" }}>✕</button>
+                      </span>
+                    ) : (
+                      <span style={{ display: "inline-flex", gap: 4 }}>
+                        <button onClick={() => onReopen(t.id)} title="Reopen (set To Do)" style={{ background: "none", border: "none", color: "#fbbf24", cursor: "pointer", fontSize: 14, fontFamily: "inherit" }}>↩</button>
+                        {onEdit && <button onClick={() => onEdit(t)} title="Edit" style={{ background: "none", border: "none", color: "#6baaf8", cursor: "pointer", fontSize: 14, fontFamily: "inherit" }}>✎</button>}
+                        <button onClick={() => setConfirmId(t.id)} title="Delete" style={{ background: "none", border: "none", color: "#94b4cc", cursor: "pointer", fontSize: 16, fontFamily: "inherit" }}>×</button>
+                      </span>
+                    ))}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
