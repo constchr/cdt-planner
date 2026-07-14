@@ -538,14 +538,17 @@ function plannedDaysInMonth(startStr, totalDays, year, month) {
   return inMonth;
 }
 
-// Sum of planned working-days that a person's active tasks place in a month.
-// (man-days × 2 laid as working days from each task's start — the "1 MD = 2 days"
-// rule. Shared by the workload view, the over-capacity alert, and the heatmap.)
-function monthPlannedDays(activeTasks, year, month) {
-  return activeTasks.reduce((s, t) => {
-    // An absence occupies its literal leave working-days; a task uses md × 2.
-    const content = t.kind === "absence" ? (t.manDays || 0) : (t.manDays || 0) * 2;
-    return s + plannedDaysInMonth(t.startDate, content, year, month);
+// Sum of the man-days a person's tasks place inside a month. Each task's
+// man-days are laid out one per working day from its start date; only the part
+// landing in the month counts. Shared by the workload view, the over-capacity
+// alert, and the heatmap.
+//
+// An absence is stored as leave *working days*, not effort — a day off costs the
+// person only their FTE share of a man-day (0.5 FTE → half a man-day per day off).
+function monthPlannedDays(tasks, year, month, fte = 1) {
+  return tasks.reduce((s, t) => {
+    const inMonth = plannedDaysInMonth(t.startDate, t.manDays || 0, year, month);
+    return s + (t.kind === "absence" ? inMonth * fte : inMonth);
   }, 0);
 }
 
@@ -1482,12 +1485,11 @@ function PlannerApp({ initData, onLogout }) {
       const totalMD = allTasks.filter(t => !t.isAbsence).reduce((s, t) => s + (t.manDays || 0), 0);
       const activeMD = activeTasks.filter(t => !t.isAbsence).reduce((s, t) => s + (t.manDays || 0), 0);
       const cfg = members[m] || { fte: 1 };
-      // Planned days that actually fall in the target month (see monthPlannedDays).
+      // Man-days landing in the target month (see monthPlannedDays).
       // Includes Done tasks — completed work still consumed capacity in its month.
-      const plannedDays = monthPlannedDays(allTasks, year, month);
-      // Available working days per month is a flat 20 — NOT scaled by FTE. FTE
-      // only affects how long a task takes on the timeline, not monthly capacity.
-      const availableDays = HORIZON_DAYS;
+      const plannedDays = monthPlannedDays(allTasks, year, month, cfg.fte);
+      // Capacity = 20 working days a month, scaled by FTE (0.5 FTE → 10 md).
+      const availableDays = HORIZON_DAYS * cfg.fte;
       const utilization = availableDays > 0 ? (plannedDays / availableDays) * 100 : 0;
       return { member: m, tasks: allTasks, activeTasks, totalMD, activeMD, plannedDays, availableDays, utilization, cfg, color: memberColors[m] };
     });
@@ -1510,10 +1512,11 @@ function PlannerApp({ initData, onLogout }) {
     const d = new Date();
     const y = d.getFullYear(), m = d.getMonth();
     return memberNames.filter(name => {
+      const fte = members[name]?.fte ?? 1;
       const mine = enriched.filter(t => t.assignee === name);
-      return monthPlannedDays(mine, y, m) > HORIZON_DAYS;
+      return monthPlannedDays(mine, y, m, fte) > HORIZON_DAYS * fte;
     });
-  }, [enriched, memberNames]);
+  }, [enriched, memberNames, members]);
 
   // Tasks shown on the Schedule (Gantt/list). Done tasks are hidden from the
   // schedule; absences stay. Then the customer/status filters apply.
@@ -1846,12 +1849,11 @@ function PlannerApp({ initData, onLogout }) {
               <div style={{ lineHeight: 2 }}>
                 <div style={{ fontSize: 14, fontWeight: 700, color: utilColor(workload.teamUtilization) }}>{Math.round(workload.teamUtilization)}% utilization · {targetMonth.label}</div>
                 <StatRow gap={5} mt={4}>
-                  <StatChip label="planned" value={`${Math.round(workload.totalPlanned)}d`} />
-                  <StatChip label="available" value={`${Math.round(workload.totalAvailable)}d`} />
+                  <StatChip label="planned" value={`${Math.round(workload.totalPlanned * 10) / 10} md`} />
+                  <StatChip label="capacity" value={`${Math.round(workload.totalAvailable * 10) / 10} md`} />
                 </StatRow>
                 <StatRow gap={5} mt={5}>
-                  <StatChip label="capacity" value={`${HORIZON_DAYS} d/mo`} />
-                  <StatChip label="rule" value="1 MD = 2 days" />
+                  <StatChip label="rule" value={`${HORIZON_DAYS} md/mo × FTE`} />
                 </StatRow>
               </div>
             </div>
@@ -1889,8 +1891,8 @@ function PlannerApp({ initData, onLogout }) {
                   </div>
                   <StatRow gap={4} mt={4} mb={8}>
                     <StatChip label="active" value={`${w.activeMD} md`} color={w.color} accent={w.color} />
-                    <StatChip label="planned" value={`${Math.round(w.plannedDays)}d`} />
-                    <StatChip label="avail" value={`${Math.round(w.availableDays)}d`} />
+                    <StatChip label="planned" value={`${Math.round(w.plannedDays * 10) / 10} md`} />
+                    <StatChip label="capacity" value={`${Math.round(w.availableDays * 10) / 10} md`} />
                   </StatRow>
                   <div className="cdt-nav">
                     {Object.keys(STATUS_CONFIG).map(s => {
@@ -2002,6 +2004,7 @@ function PlannerApp({ initData, onLogout }) {
             <CapacityView
               memberNames={memberNames}
               memberColors={memberColors}
+              members={members}
               enriched={enriched}
               onPickMonth={(offset) => { setMonthOffset(offset); setView("workload"); }}
             />
@@ -2736,7 +2739,7 @@ function DoneView({ enriched, memberNames, memberColors, isAdmin, onReopen, onDe
 
 // ─── Capacity heatmap ─────────────────────────────────────────────────────────
 
-function CapacityView({ memberNames, memberColors, enriched, onPickMonth }) {
+function CapacityView({ memberNames, memberColors, members, enriched, onPickMonth }) {
   const MONTHS = 6;
   const months = useMemo(() => {
     const base = new Date(); base.setDate(1);
@@ -2751,13 +2754,15 @@ function CapacityView({ memberNames, memberColors, enriched, onPickMonth }) {
   // Precompute util per member per month. Includes Done tasks — completed work
   // still consumed capacity in the month it was scheduled.
   const grid = useMemo(() => memberNames.map(name => {
+    const fte = members[name]?.fte ?? 1;
+    const avail = HORIZON_DAYS * fte;   // capacity in man-days for this person
     const active = enriched.filter(t => t.assignee === name);
     const cells = months.map(mo => {
-      const planned = monthPlannedDays(active, mo.year, mo.month);
-      return { ...mo, planned, util: HORIZON_DAYS > 0 ? (planned / HORIZON_DAYS) * 100 : 0 };
+      const planned = monthPlannedDays(active, mo.year, mo.month, fte);
+      return { ...mo, planned, avail, util: avail > 0 ? (planned / avail) * 100 : 0 };
     });
-    return { name, color: memberColors[name], cells };
-  }), [memberNames, enriched, months, memberColors]);
+    return { name, fte, color: memberColors[name], cells };
+  }), [memberNames, members, enriched, months, memberColors]);
 
   const cellBase = { padding: "10px 8px", textAlign: "center", borderBottom: "1px solid #0d1220", fontVariantNumeric: "tabular-nums" };
 
@@ -2765,7 +2770,7 @@ function CapacityView({ memberNames, memberColors, enriched, onPickMonth }) {
     <div>
       <ViewHeader label="CAPACITY" accent="#4FD4A0" title="Capacity Heatmap" />
       <div style={{ fontSize: 14, color: "#b8cfe0", marginBottom: 16, lineHeight: 1.6 }}>
-        Monthly utilization per person over the next {MONTHS} months — planned working days ÷ 20. Click a cell to open that month in Workload.
+        Monthly utilization per person over the next {MONTHS} months — man-days planned ÷ (20 × FTE). Click a cell to open that month in Workload.
       </div>
       <div style={{ overflowX: "auto", border: "1px solid #2d3f55", borderRadius: 10, background: "#111827" }}>
         <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 520, fontSize: 14 }}>
@@ -2785,12 +2790,13 @@ function CapacityView({ memberNames, memberColors, enriched, onPickMonth }) {
                 <td style={{ padding: "8px 14px", whiteSpace: "nowrap", borderBottom: "1px solid #0d1220", position: "sticky", left: 0, background: "#111827", display: "flex", alignItems: "center", gap: 8 }}>
                   <span style={{ width: 22, height: 22, borderRadius: "50%", background: row.color + "22", border: `2px solid ${row.color}`, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: row.color, flexShrink: 0 }}>{initials(row.name)}</span>
                   <span style={{ fontSize: 14, fontWeight: 700, color: "#f1f5f9" }}>{row.name}</span>
+                  <StatChip label="FTE" value={row.fte.toFixed(1)} />
                 </td>
                 {row.cells.map(c => {
                   const col = utilColor(c.util);
                   const has = c.planned > 0;
                   return (
-                    <td key={c.offset} onClick={() => onPickMonth(c.offset)} title={`${row.name} · ${c.full}\n${c.planned.toFixed(1)} planned / ${HORIZON_DAYS} days`}
+                    <td key={c.offset} onClick={() => onPickMonth(c.offset)} title={`${row.name} · ${c.full}\n${c.planned.toFixed(1)} md planned / ${c.avail} md capacity`}
                       style={{ ...cellBase, cursor: "pointer", background: has ? col + "1f" : "transparent" }}>
                       <span style={{ fontSize: 14, fontWeight: 700, color: has ? col : "#3d5068" }}>{Math.round(c.util)}%</span>
                     </td>
