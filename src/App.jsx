@@ -22,6 +22,7 @@ function appTask(r) {
     startDate: r.start_date, jiraUrl: r.jira_url || "", deps: r.deps || [],
     kind: r.kind || "task",   // "task" | "absence"
     doneAt: r.done_at || null, // ISO timestamp when marked Done
+    noOverdue: r.no_overdue === true, // not time-critical → never flagged overdue
   };
 }
 // Map app task → DB row
@@ -33,6 +34,7 @@ function dbTask(t) {
     start_date: t.startDate, jira_url: t.jiraUrl || null, deps: t.deps || [],
     kind: t.kind || "task",
     done_at: t.doneAt || null,
+    no_overdue: t.noOverdue === true,
   };
 }
 
@@ -1102,7 +1104,7 @@ function GanttChart({ enriched, members, memberColors, memberNames, onMoveTask, 
                   const barLeft  = startOff * DAY_PX + 2;
                   const barTop   = ROW_PAD / 2 + ti * (BAR_H + BAR_GAP);
                   const sc       = STATUS_CONFIG[task.status] || STATUS_CONFIG["To Do"];
-                  const overdue  = isOverdue(task.dueDate) && task.status !== "Done";
+                  const overdue  = task.overdue;
                   const isDragging = dragRef.current?.taskId === task.id;
 
                   return (
@@ -1268,7 +1270,7 @@ function ScheduleListView({ enriched, memberNames, memberColors, onEditTask }) {
             {mTasks.length === 0 ? (
               <div style={{ fontSize: 13, color: "#6b84a0", paddingLeft: 34, marginBottom: 4 }}>No tasks</div>
             ) : mTasks.map(t => {
-              const overdue = isOverdue(t.dueDate) && t.status !== "Done";
+              const overdue = t.overdue;
               return (
                 <div key={t.id} onClick={() => onEditTask && onEditTask(t)}
                   style={{ background: "#111827", border: `1px solid ${color}33`, borderLeft: `3px solid ${color}`, borderRadius: 8, padding: "10px 12px", marginBottom: 6, cursor: onEditTask ? "pointer" : "default" }}>
@@ -1390,6 +1392,7 @@ function PlannerApp({ initData, onLogout }) {
         bufferDays: parseInt(r.bufferDays) || 0, startDate: r.startDate, deps: r.deps || [],
         jiraUrl: r.jiraUrl || "", kind: r.kind || "task",
         doneAt: r.status === "Done" ? new Date().toISOString() : null,
+        noOverdue: r.noOverdue === true,
       };
       if (task.assignee) addMemberIfNew(task.assignee);
       if (task.customer) addCustomer(task.customer);
@@ -1441,7 +1444,7 @@ function PlannerApp({ initData, onLogout }) {
       const wd = Math.max(t.manDays || 0, 0);
       const endDate = t.startDate ? addWorkingDays(t.startDate, wd) : null;
       const totalDays = (t.startDate && endDate) ? Math.max(calDaysBetween(t.startDate, toISO(endDate)), 1) : wd;
-      return { ...t, isAbsence: true, pureWdays: wd, workingDays: wd, totalDays, calWork: wd, endDate, dueDate: endDate };
+      return { ...t, isAbsence: true, overdue: false, pureWdays: wd, workingDays: wd, totalDays, calWork: wd, endDate, dueDate: endDate };
     }
     const m          = members[t.assignee] || { fte: 1 };
     const pureWdays  = calcWorkingDays(t.manDays, m.fte, t.efficiencyPct);
@@ -1453,7 +1456,10 @@ function PlannerApp({ initData, onLogout }) {
     // calWork = calendar span of pure work portion (for Gantt buffer shading ratio)
     const endNoBuffer = calcTaskEnd(t.startDate, t.manDays, m.fte, t.efficiencyPct, 0);
     const calWork    = (t.startDate && endNoBuffer) ? calDaysBetween(t.startDate, toISO(endNoBuffer)) : pureWdays;
-    return { ...t, isAbsence: false, pureWdays, workingDays, totalDays, calWork, endDate, dueDate };
+    // Single source of truth for overdue reporting. Dates above are unaffected —
+    // a not-time-critical task still gets the same dueDate, it's just never flagged.
+    const overdue    = !t.noOverdue && t.status !== "Done" && isOverdue(dueDate);
+    return { ...t, isAbsence: false, overdue, pureWdays, workingDays, totalDays, calWork, endDate, dueDate };
   }), [tasks, members]);
 
   // The calendar month utilization is computed for (current month + offset).
@@ -1495,7 +1501,7 @@ function PlannerApp({ initData, onLogout }) {
   }, [enriched, memberNames, members, memberColors, targetMonth]);
 
   const overdueCount = useMemo(
-    () => enriched.filter(t => isOverdue(t.dueDate) && t.status !== "Done").length,
+    () => enriched.filter(t => t.overdue).length,
     [enriched]);
 
   // Members over 100% capacity in the *current* calendar month (independent of
@@ -1906,7 +1912,7 @@ function PlannerApp({ initData, onLogout }) {
               const baseTasks = scope.filter(t => !t.isAbsence && t.status !== "Done");
               const q = taskSearch.trim().toLowerCase();
               const visibleTasks = baseTasks.filter(t => {
-                if (overdueOnly && !(isOverdue(t.dueDate) && t.status !== "Done")) return false;
+                if (overdueOnly && !t.overdue) return false;
                 if (statusFilter !== "All" && t.status !== statusFilter) return false;
                 if (!q) return true;
                 return [t.summary, t.id, t.assignee, t.customer].some(v => (v || "").toLowerCase().includes(q));
@@ -2449,7 +2455,7 @@ function TeamView({ members, memberNames, memberColors, enriched, onUpdateMember
                   {activeTasks.slice(0, 3).map(t => (
                     <div key={t.id} style={{ display: "flex", justifyContent: "space-between", marginBottom: 4, alignItems: "baseline" }}>
                       <span style={{ fontSize: 14, color: "#b8cfe0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 155 }}>{t.summary}</span>
-                      <span style={{ fontSize: 14, fontWeight: 700, marginLeft: 6, whiteSpace: "nowrap", color: isOverdue(t.dueDate) ? "#ef4444" : "#F7D44F" }}>{fmtDate(t.dueDate)}</span>
+                      <span style={{ fontSize: 14, fontWeight: 700, marginLeft: 6, whiteSpace: "nowrap", color: t.overdue ? "#ef4444" : "#F7D44F" }}>{fmtDate(t.dueDate)}</span>
                     </div>
                   ))}
                   {activeTasks.length > 3 && <div style={{ fontSize: 13, color: "#94b4cc" }}>+{activeTasks.length - 3} more</div>}
@@ -2572,7 +2578,7 @@ function SimpleTaskTable({ tasks, onStatusChange, onDelete, onEdit, memberColors
         </thead>
         <tbody>
           {tasks.map((t, i) => {
-            const overdue = isOverdue(t.dueDate) && t.status !== "Done";
+            const overdue = t.overdue;
             const isSel = sel && selectedIds.has(t.id);
             return (
               <tr key={t.id} style={{ borderBottom: i < tasks.length - 1 ? "1px solid #0d1220" : "none", background: isSel ? "#1e3a5f55" : "transparent" }}>
@@ -2926,7 +2932,7 @@ function StatusCallView({ memberNames, memberColors, members, enriched, statusNo
                   </StatRow>
                 </div>
                 {/* Overdue flag */}
-                {activeTasks.some(t => isOverdue(t.dueDate)) && (
+                {activeTasks.some(t => t.overdue) && (
                   <span style={{
                     fontSize: 13, fontWeight: 700, padding: "3px 9px", borderRadius: 5,
                     background: "#4a1212", color: "#f87171", border: "1px solid #ef444433",
@@ -2941,7 +2947,7 @@ function StatusCallView({ memberNames, memberColors, members, enriched, statusNo
                   <div style={{ fontSize: 14, color: "#94b4cc", marginBottom: 12 }}>No active scheduled tasks</div>
                 )}
                 {activeTasks.map(t => {
-                  const overdue = isOverdue(t.dueDate);
+                  const overdue = t.overdue;
                   const note = notes.taskNotes[t.id] || "";
                   return (
                     <div key={t.id} style={{
@@ -3471,7 +3477,7 @@ function AddTaskModal({ initialAssignee, initialStartDate, memberNames, members,
     status: "To Do", priority: "Medium",
     manDays: 1, efficiencyPct: 100, bufferDays: 0,
     startDate: initialStartDate || toISO(new Date()),
-    deps: [], jiraUrl: "",
+    deps: [], jiraUrl: "", noOverdue: false,
   });
   const [depInput, setDepInput] = useState("");
   const f = (k, v) => setTask(p => ({ ...p, [k]: v }));
@@ -3539,6 +3545,13 @@ function AddTaskModal({ initialAssignee, initialStartDate, memberNames, members,
               </select>
             </div>
             <div><label style={lStyle}>DEPENDENCIES (semicolon-separated)</label><input value={depInput} onChange={e => { setDepInput(e.target.value); f("deps", e.target.value.split(";").map(d=>d.trim()).filter(Boolean)); }} placeholder="e.g. T-101; T-102" style={iStyle} /></div>
+            <div style={{ gridColumn:"1/-1" }}>
+              <label style={{ display:"flex", alignItems:"center", gap:9, cursor:"pointer", padding:"9px 11px", borderRadius:7, background:"var(--bg-inset,#0f1a2e)", border:"1px solid var(--border,#2d3f55)" }}>
+                <input type="checkbox" checked={!!task.noOverdue} onChange={e => f("noOverdue", e.target.checked)} style={{ accentColor:"#fbbf24", cursor:"pointer" }} />
+                <span style={{ fontSize:13, color:"var(--fg,#f0f4ff)", fontWeight:700 }}>Not time-critical</span>
+                <span style={{ fontSize:12, color:"var(--fg-faint,#94b4cc)" }}>— never report this task as overdue</span>
+              </label>
+            </div>
 
             {/* Preview */}
             {task.assignee && task.startDate && (
@@ -3579,7 +3592,7 @@ function EditTaskModal({ task: initialTask, memberNames, members, customers, onA
   const wdays  = pureW + buf;  // working days incl. buffer
   const due    = task.assignee && task.startDate ? calcDueDate(task.startDate, md, m.fte, eff, buf) : null;
   const total  = (task.startDate && due) ? calDaysBetween(task.startDate, toISO(due)) : wdays;  // calendar days start→due
-  const overdue = due && isOverdue(due) && task.status !== "Done";
+  const overdue = !task.noOverdue && due && isOverdue(due) && task.status !== "Done";
 
   const iStyle = { width:"100%", padding:"9px 11px", borderRadius:7, background:"var(--bg-inset,#0f1a2e)", border:"1px solid var(--border,#2d3f55)", color:"var(--fg,#f0f4ff)", fontSize:13, fontFamily:"inherit", outline:"none", boxSizing:"border-box" };
   const lStyle = { fontSize:10, color:"var(--fg-faint,#94b4cc)", letterSpacing:"0.12em", display:"block", marginBottom:5, fontWeight:600 };
@@ -3640,6 +3653,13 @@ function EditTaskModal({ task: initialTask, memberNames, members, customers, onA
             <div style={{ gridColumn:"1/-1" }}>
               <label style={lStyle}>DEPENDENCIES (blocking task IDs, semicolon-separated)</label>
               <input value={depInput} onChange={e => { setDepInput(e.target.value); f("deps", e.target.value.split(";").map(d=>d.trim()).filter(Boolean)); }} placeholder="e.g. T-101; T-102" style={iStyle} />
+            </div>
+            <div style={{ gridColumn:"1/-1" }}>
+              <label style={{ display:"flex", alignItems:"center", gap:9, cursor:"pointer", padding:"9px 11px", borderRadius:7, background:"var(--bg-inset,#0f1a2e)", border:"1px solid var(--border,#2d3f55)" }}>
+                <input type="checkbox" checked={!!task.noOverdue} onChange={e => f("noOverdue", e.target.checked)} style={{ accentColor:"#fbbf24", cursor:"pointer" }} />
+                <span style={{ fontSize:13, color:"var(--fg,#f0f4ff)", fontWeight:700 }}>Not time-critical</span>
+                <span style={{ fontSize:12, color:"var(--fg-faint,#94b4cc)" }}>— never report this task as overdue (dates are unchanged)</span>
+              </label>
             </div>
 
             {/* Preview */}
@@ -3783,6 +3803,12 @@ function ImportModal({ memberNames, existingIds, onImport, onClose }) {
                           </select>
                         </div>
                         <div><label style={lStyle}>START DATE</label><input type="date" value={r.startDate} onChange={e => setRow(i, { startDate:e.target.value })} style={{ ...iStyle, colorScheme:"dark" }} /></div>
+                        <div style={{ gridColumn:"1/-1" }}>
+                          <label style={{ display:"flex", alignItems:"center", gap:8, cursor:"pointer", fontSize:12, color:"var(--fg-muted,#b8cfe0)" }}>
+                            <input type="checkbox" checked={!!r.noOverdue} onChange={e => setRow(i, { noOverdue:e.target.checked })} style={{ accentColor:"#fbbf24", cursor:"pointer" }} />
+                            Not time-critical — never report as overdue
+                          </label>
+                        </div>
                       </div>
                     </div>
                   );
